@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mycodingagent"
+version = "0.1.0"
+description = "自研 AI coding agent（阶段 0：工程基建）"
+requires-python = ">=3.11"
+dependencies = [
+    "deepagents>=0.7",
+    "langchain-core>=1.6",
+    "langchain-openai>=1.6",
+    "langgraph>=1.2",
+    "langgraph-checkpoint-sqlite>=3.1",
+    "langchain-tavily>=0.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[project.scripts]
+mycodingagent = "mycodingagent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

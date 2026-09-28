@@ -1,0 +1,15 @@
+pyproject.toml
+src/mycodingagent/__init__.py
+src/mycodingagent/__main__.py
+src/mycodingagent/agent.py
+src/mycodingagent/cli.py
+src/mycodingagent/config.py
+src/mycodingagent.egg-info/PKG-INFO
+src/mycodingagent.egg-info/SOURCES.txt
+src/mycodingagent.egg-info/dependency_links.txt
+src/mycodingagent.egg-info/entry_points.txt
+src/mycodingagent.egg-info/requires.txt
+src/mycodingagent.egg-info/top_level.txt
+src/mycodingagent/tools/__init__.py
+src/mycodingagent/tools/calculator.py
+tests/test_calculator.py

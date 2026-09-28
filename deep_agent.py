@@ -360,7 +360,7 @@ def chat(agent, store) -> None:
 
 def main():
     if not API_KEY:
-        print("未检测到 DASHSCOPE_API_KEY！请先设置环境变量。")
+        print("未检测到 AGICTO_API_KEY！请先设置环境变量。")
         return
 
     # SqliteSaver = 短期记忆（对话历史）  SqliteStore = 长期记忆（用户信息）
