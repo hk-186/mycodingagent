@@ -12,8 +12,16 @@
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 # 项目根目录（config.py 位于 src/mycodingagent/ 下，向上三级）
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# ------------------------------------------------------------
+# 加载项目根目录的 .env 文件（若存在；系统环境变量优先，不会被覆盖）。
+# 必须在下方所有 os.getenv 之前执行。
+# ------------------------------------------------------------
+load_dotenv(PROJECT_ROOT / ".env")
 
 # ------------------------------------------------------------
 # LangSmith 追踪：显式 opt-in（修复计划 E6）
