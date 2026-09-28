@@ -1,2 +1,0 @@
-[console_scripts]
-mycodingagent = mycodingagent.cli:main
