@@ -5,3 +5,4 @@ __pycache__/
 .env
 *.sqlite*
 deep_agent_workspace/
+workspace/

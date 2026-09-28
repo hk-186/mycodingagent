@@ -40,8 +40,8 @@ LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
 # ------------------------------------------------------------
 # 存储路径：锚定项目根目录，不受启动时的工作目录影响
 # ------------------------------------------------------------
-CHECKPOINT_DB = str(PROJECT_ROOT / "deep_agent_checkpoint.sqlite")  # 短期记忆：对话历史
-STORE_DB = str(PROJECT_ROOT / "deep_agent_memory.sqlite")  # 长期记忆：用户信息
+CHECKPOINT_DB = str(PROJECT_ROOT / "agent_state.sqlite")  # 短期记忆：对话历史
+STORE_DB = str(PROJECT_ROOT / "agent_memory.sqlite")  # 长期记忆：用户信息
 
 # Agent 的"笔记本"目录：虚拟文件系统里写的文件都会落在这里
-WORKSPACE_DIR = PROJECT_ROOT / "deep_agent_workspace"
+WORKSPACE_DIR = PROJECT_ROOT / "workspace"
