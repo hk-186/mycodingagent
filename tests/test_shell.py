@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """危险命令拦截 + SafeShellBackend 行为测试（阶段 1：shell 工具）。"""
 
+import sys
+
 import pytest
 
 from mycodingagent.permissions import check_command
-from mycodingagent.tools.shell import SafeShellBackend
+from mycodingagent.tools.shell import SafeShellBackend, _decode_output
 
 
 # ============================================================
@@ -100,3 +102,34 @@ def test_backend_timeout(backend):
     )
     assert result.exit_code == 124           # 超时统一返回 124
     assert "timed out" in result.output
+
+
+# ============================================================
+# 输出编码：UTF-8 优先，Windows 上 GBK 回退（修复 dir 等命令乱码）
+# ============================================================
+def test_decode_utf8_takes_precedence():
+    assert _decode_output("下午".encode("utf-8")) == "下午"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="GBK 回退只在 Windows 候选编码中")
+def test_decode_gbk_fallback():
+    assert _decode_output("下午".encode("gbk")) == "下午"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="cmd 输出编码问题是 Windows 专属")
+def test_backend_decodes_gbk_output(backend):
+    # 直接写 GBK 字节到 stdout，模拟 dir 等 cmd 内置命令的输出
+    result = backend.execute(
+        "python -c \"import sys; sys.stdout.buffer.write('下午'.encode('gbk'))\""
+    )
+    assert result.exit_code == 0
+    assert "下午" in result.output
+    assert "涓嬪崍" not in result.output      # 乱码不能再出现
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="PYTHONIOENCODING 行为在 Windows 验证")
+def test_backend_child_python_utf8_output(backend):
+    # 子 Python 进程经 PYTHONIOENCODING=utf-8 输出，应正常解码
+    result = backend.execute("python -c \"print('中文输出')\"")
+    assert result.exit_code == 0
+    assert "中文输出" in result.output

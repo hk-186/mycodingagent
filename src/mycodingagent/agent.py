@@ -7,6 +7,8 @@ Agent 构建
 """
 
 import logging
+import platform
+import sys
 from datetime import datetime
 
 from langchain.agents.middleware import TodoListMiddleware  # write_todos 工具 + todos 状态
@@ -86,6 +88,26 @@ def recall_user_info_list() -> str:
 # ============================================================
 # 构建 Deep Agent
 # ============================================================
+def _shell_environment_hint() -> str:
+    """告诉模型 execute 实际运行的 shell 环境，避免按错平台写命令。
+
+    subprocess(shell=True) 在 Windows 上走 cmd.exe，POSIX 上走 /bin/sh，
+    两套语法不同（分隔符、列目录、环境变量等），必须显式告知。
+    """
+    if sys.platform == "win32":
+        return (
+            f"运行平台：Windows（{platform.release()}），execute 的命令由 cmd.exe 执行。\n"
+            "- 多条命令用 && 连接，禁止用分号 ;\n"
+            "- 列目录用 dir（不是 ls），查看当前目录用 cd（不是 pwd）\n"
+            "- 路径用反斜杠或加引号；环境变量写作 %VAR%（不是 $VAR）\n"
+            "- 递归删除目录属于危险操作会被拦截，确有需要请让用户手动执行\n"
+        )
+    return (
+        f"运行平台：{platform.system()}，execute 的命令由 /bin/sh 执行。\n"
+        "- 多条命令用 && 连接，列目录用 ls，查看当前目录用 pwd。\n"
+    )
+
+
 def build_deep_agent(checkpointer, store):
     """
     create_deep_agent 关键参数：
@@ -143,8 +165,15 @@ def build_deep_agent(checkpointer, store):
         system_prompt=(
             f"你是 mycodingagent，一个在用户真实仓库里工作的 coding agent。\n"
             f"当前工作目标目录：{config.PROJECT_DIR}\n"
-            "（read_file / edit_file / glob / grep 等文件操作以此为根；"
-            "execute 执行的 shell 命令也在此目录运行。）\n"
+            "\n## 文件路径约定（重要）\n"
+            "- ls / read_file / write_file / edit_file / glob / grep 一律使用"
+            "以 / 开头的虚拟路径，/ 就代表上面的项目目录本身：\n"
+            "  / 映射到项目根目录；/src/app.py 映射到 项目目录/src/app.py。\n"
+            "- 禁止给这些工具传 D:\\... 这类 Windows 绝对路径（会直接报错）。\n"
+            "- 不要再把项目目录名拼到虚拟路径后面：例如项目目录是 workspace 时，"
+            "用 / 而不是 /workspace（后者会去找 workspace/workspace）。\n"
+            "- execute 的 shell 命令每次都已在项目目录内运行，无需 cd。\n"
+            + _shell_environment_hint()
             + search_hint
             + "\n## 编码工作守则\n"
             "1. 先读后改：修改任何文件前必须先 read_file 看清现状，"
@@ -155,7 +184,7 @@ def build_deep_agent(checkpointer, store):
             "不改动无关的格式与注释。\n"
             "4. 用 edit_file 做精确替换（old_string 必须在文件中唯一，"
             "否则会报错）；只有新建文件才用 write_file。\n"
-            "5. 改完自测：每次修改后用 execute 运行相关脚本或测试，"
+            "5. 改完自测：每次修改后，用 execute 运行相关脚本或测试，"
             "拿到 exit code 和报错后继续修复，直到验证通过为止。\n"
             "6. 危险命令（递归删除、格式化磁盘、关机等）会被系统直接拒绝，"
             "被拒绝时不要换写法绕过，向用户说明即可。\n"
