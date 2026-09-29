@@ -9,15 +9,16 @@ Agent 构建
 import logging
 from datetime import datetime
 
+from langchain.agents.middleware import TodoListMiddleware  # write_todos 工具 + todos 状态
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.config import get_store  # 工具运行时由 agent 注入 store
 
 from deepagents import create_deep_agent
-from deepagents.backends import FilesystemBackend
 
 from mycodingagent import config
 from mycodingagent.tools.calculator import calculate
+from mycodingagent.tools.shell import SafeShellBackend
 
 logger = logging.getLogger(__name__)
 
@@ -89,15 +90,17 @@ def build_deep_agent(checkpointer, store):
     """
     create_deep_agent 关键参数：
 
-    - backend：FilesystemBackend 把 Agent 的文件读写限制在工作目录内
+    - backend：SafeShellBackend 把文件工具与 execute 的根目录锚定在项目目录，
+      并在执行 shell 命令前做危险命令拦截（阶段 1）
+    - middleware：TodoListMiddleware 提供 write_todos 工具（阶段 1 缺口 C6）
     - subagents：注册后主 Agent 自动获得 task 工具，按 description 决定何时委派
     - checkpointer / store：短期记忆（对话历史）/ 长期记忆（用户信息）
     - memory：AGENTS.md 风格的规则记忆，内容每轮注入 system prompt
     """
     llm = get_llm()
 
-    # 确保工作目录存在（Agent 往里写文件时才有落脚点）
-    config.WORKSPACE_DIR.mkdir(exist_ok=True)
+    # 确保默认工作目录存在（真实项目目录已存在，此调用对它是 no-op）
+    config.PROJECT_DIR.mkdir(exist_ok=True)
 
     # 主 Agent 的工具：时间 + 长期记忆读写（+ 设置了密钥时的联网搜索）
     tools = [
@@ -134,19 +137,32 @@ def build_deep_agent(checkpointer, store):
     agent = create_deep_agent(
         model=llm,
         tools=tools,
-        backend=FilesystemBackend(root_dir=str(config.WORKSPACE_DIR)),
+        backend=SafeShellBackend(root_dir=str(config.PROJECT_DIR), inherit_env=True),
+        middleware=[TodoListMiddleware()],
         subagents=[calculator_subagent],   # 注册子代理 → 主 Agent 获得 task 工具
         system_prompt=(
-            "你是一个擅长完成深度任务的智能助手。严格遵守以下工具使用规则：\n"
+            f"你是 mycodingagent，一个在用户真实仓库里工作的 coding agent。\n"
+            f"当前工作目标目录：{config.PROJECT_DIR}\n"
+            "（read_file / edit_file / glob / grep 等文件操作以此为根；"
+            "execute 执行的 shell 命令也在此目录运行。）\n"
             + search_hint
-            + "- 任何数学计算都不要心算，使用 task 工具委派给 calculator 子代理\n"
-            "- 需要时间信息时调用 get_current_time\n"
-            "- save_user_info：用户提到自己的个人信息（名字、年龄、偏好等）时，"
-            "每一项分别调用一次保存\n"
-            "- recall_user_info：需要了解用户信息时调用，宁可多查也不要凭空猜测；"
-            "不确定 key 时先用 recall_user_info_list 列出全部\n"
-            "- 调研过程和最终成果用 write_file 写入文件保存（放在当前工作目录）\n"
-            "- 完成后用中文简要汇报：做了什么、结论是什么、文件保存在哪里"
+            + "\n## 编码工作守则\n"
+            "1. 先读后改：修改任何文件前必须先 read_file 看清现状，"
+            "禁止凭想象猜测文件内容。\n"
+            "2. 不臆造路径：不确定文件位置时，先用 glob / grep / ls 定位，"
+            "再动手。\n"
+            "3. 最小修改：只改动完成任务必需的部分，不顺手重构、"
+            "不改动无关的格式与注释。\n"
+            "4. 用 edit_file 做精确替换（old_string 必须在文件中唯一，"
+            "否则会报错）；只有新建文件才用 write_file。\n"
+            "5. 改完自测：每次修改后用 execute 运行相关脚本或测试，"
+            "拿到 exit code 和报错后继续修复，直到验证通过为止。\n"
+            "6. 危险命令（递归删除、格式化磁盘、关机等）会被系统直接拒绝，"
+            "被拒绝时不要换写法绕过，向用户说明即可。\n"
+            "\n## 任务管理\n"
+            "- 多步任务先调用 write_todos 列出计划，每完成一步立即更新状态，"
+            "全部完成后再汇报。\n"
+            "- 完成后用中文简要汇报：改了哪些文件、如何验证、结果如何。"
         ),
         memory=["/AGENTS.md"],  # 规则型记忆：AGENTS.md 内容每轮注入 system prompt
         checkpointer=checkpointer,  # 短期记忆：对话历史按 thread_id 持久化

@@ -13,6 +13,7 @@
     /exit        退出
 """
 
+import argparse
 import logging
 import os
 from datetime import datetime
@@ -68,7 +69,7 @@ def run_task(agent, user_input: str, thread_id: str = "main") -> None:
 # ============================================================
 def chat(agent, store) -> None:
     thread_id = "main"  # 默认会话固定 id：重启进程后可接着聊（短期记忆持久化）
-    print(f"模型: {config.MODEL_NAME} | 会话: {thread_id} | 工作目录: {config.WORKSPACE_DIR}")
+    print(f"模型: {config.MODEL_NAME} | 会话: {thread_id} | 项目目录: {config.PROJECT_DIR}")
     print("输入 /help 查看命令，/exit 退出\n")
 
     while True:
@@ -113,6 +114,24 @@ def chat(agent, store) -> None:
 
 
 def main() -> None:
+    # 命令行参数：--project 指定工作目标项目目录（阶段 1 缺口 C3）
+    parser = argparse.ArgumentParser(
+        prog="mycodingagent",
+        description="自研 AI coding agent",
+    )
+    parser.add_argument(
+        "--project",
+        default=None,
+        help="工作目标项目目录（默认 workspace/，或环境变量 AGENT_PROJECT_DIR）",
+    )
+    args = parser.parse_args()
+    if args.project:
+        try:
+            config.set_project_dir(args.project)
+        except NotADirectoryError as e:
+            print(str(e))
+            return
+
     # logging：级别走 LOG_LEVEL 环境变量（默认 WARNING，调试时设 INFO/DEBUG）
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "WARNING").upper(),

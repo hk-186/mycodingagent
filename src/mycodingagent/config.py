@@ -51,5 +51,25 @@ LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
 CHECKPOINT_DB = str(PROJECT_ROOT / "agent_state.sqlite")  # 短期记忆：对话历史
 STORE_DB = str(PROJECT_ROOT / "agent_memory.sqlite")  # 长期记忆：用户信息
 
-# Agent 的"笔记本"目录：虚拟文件系统里写的文件都会落在这里
-WORKSPACE_DIR = PROJECT_ROOT / "workspace"
+# ------------------------------------------------------------
+# 工作目标目录（阶段 1：从固定 workspace 改为可指定任意项目目录）
+# 优先级：CLI --project 参数 > 环境变量 AGENT_PROJECT_DIR > 默认 workspace/
+# CLI 通过 set_project_dir() 在构建 Agent 前切换。
+# ------------------------------------------------------------
+def _default_project_dir() -> Path:
+    env_dir = os.getenv("AGENT_PROJECT_DIR", "")
+    if env_dir:
+        return Path(env_dir).expanduser().resolve()
+    return PROJECT_ROOT / "workspace"
+
+
+PROJECT_DIR = _default_project_dir()
+
+
+def set_project_dir(path: str | Path) -> None:
+    """运行时切换工作目标目录（CLI --project 调用）。目录必须已存在。"""
+    global PROJECT_DIR
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_dir():
+        raise NotADirectoryError(f"项目目录不存在：{resolved}")
+    PROJECT_DIR = resolved
