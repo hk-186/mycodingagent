@@ -19,7 +19,7 @@ from langgraph.config import get_store  # 工具运行时由 agent 注入 store
 
 from deepagents import create_deep_agent
 
-from mycodingagent import config
+from mycodingagent import config, memory_common
 from mycodingagent.approvals import should_interrupt_command
 from mycodingagent.project_middleware import ProjectMemoryMiddleware
 from mycodingagent.prompt_runtime import RuntimePromptMiddleware
@@ -66,7 +66,7 @@ def get_current_time() -> str:
 def save_user_info(key: str, value: str) -> str:
     """保存用户的长期个人信息（跨项目共享）。key 是信息类别（如 name、email、hobby），value 是具体内容"""
     store = get_store()
-    store.put(("users",), key, {"value": value}, index=["value"])
+    store.put(("users",), key, memory_common.make_record(key, value))
     return f"已记住：{key} = {value}"
 
 
@@ -77,13 +77,19 @@ def recall_user_info(query: str) -> str:
     项目相关的约定请用 recall_project_fact。
     """
     store = get_store()
-    # 先精确按 key 取；找不到再走语义索引（不再全量扫描，C13）
+    # 1) 精确按 key 取
     item = store.get(("users",), query)
     if item is not None:
-        return f"{query} = {item.value['value']}"
+        return f"{query} = {memory_common.record_value(item.value)}"
+    # 2) key 子串匹配兜底：query 里夹带了明确 key（如「用户的姓名 name」）
+    all_items = store.search(("users",))
+    key_hits = memory_common.match_record_keys(query, all_items)
+    if key_hits:
+        return memory_common.format_items(key_hits)
+    # 3) 语义索引检索（向量同时编码了 key 与 value）
     hits = store.search(("users",), query=query, limit=5)
     if hits:
-        return "；".join(f"{h.key} = {h.value['value']}" for h in hits)
+        return memory_common.format_items(hits)
     return f"没有找到与「{query}」相关的记忆"
 
 
@@ -94,7 +100,7 @@ def recall_user_info_list() -> str:
     items = store.search(("users",))
     if not items:
         return "还没有保存任何用户信息"
-    return "；".join(f"{i.key} = {i.value['value']}" for i in items)
+    return memory_common.format_items(items)
 
 
 # ============================================================

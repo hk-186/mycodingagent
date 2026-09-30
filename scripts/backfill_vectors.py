@@ -1,24 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-一次性运维脚本：为历史记忆批量补语义向量
-=========================================
+一次性运维脚本：升级记忆格式并补齐语义向量
+==========================================
 
 背景：
-    阶段 5 给 SqliteStore 配置了 sqlite-vec 语义索引。该索引只对「配置生效
-    之后新写入/重新保存」的记忆自动 embed；在此之前已存在于 store 主表里的
-    历史记忆没有向量，因而无法被自然语言语义查询召回（精确 get 不受影响）。
+    早期版本的向量只编码 value 内容（text_fields=["value"]），store 的 key
+    不参与嵌入。当 value 是 "Kevin"、邮箱这类短专有名词时，自然语言查询
+    （如「用户的姓名 name」）与它语义距离很远，容易错位命中其它长文本。
 
-做法：
-    扫描 store 主表全部 (prefix, key)，与 store_vectors 中已有向量的
-    (prefix, key) 做差集；对每条缺失记录，读出原 value，通过 SqliteStore
-    官方 put 重新写入——复用框架的序列化、外键与 embed 全流程，自动生成向量。
-    不手工拼接向量 blob，避免格式/维度不一致。
+本脚本做两件事：
+    1. 把记录升级为新结构：
+       {"value": <内容>, "index_text": "<key>：<内容>"}，
+       并清除该记录残留的旧字段（field_name != "index_text"）向量；
+    2. 通过 SqliteStore 官方 put 重写，复用框架的序列化、外键与 embed 流程，
+       对 index_text（含 key）重新生成向量。
 
-注意：
-    put 是 INSERT OR REPLACE，会刷新该条记录的 created_at / updated_at
-    （value 内容不变）。这是一次性补数据的可接受代价。
+判定一条记录需要处理：value 中缺 index_text，或该 (prefix,key) 还没有
+field_name="index_text" 的向量。幂等可重复执行。
 
-用法（在项目根目录，已 pip install -e . 且 .env 配好 AGICTO_API_KEY）：
+用法（项目根目录，已 pip install -e . 且 .env 配好 AGICTO_API_KEY）：
     python scripts/backfill_vectors.py --dry-run   # 只预览，不写入
     python scripts/backfill_vectors.py             # 交互确认后执行
     python scripts/backfill_vectors.py --yes       # 跳过确认直接执行
@@ -34,44 +34,77 @@ import sys
 from langchain_openai import OpenAIEmbeddings
 from langgraph.store.sqlite import SqliteStore
 
-from mycodingagent import config
+from mycodingagent import config, memory_common
+from mycodingagent.memory_common import INDEX_TEXT_FIELD, VALUE_FIELD
 
 
-def find_missing_pairs(db_path: str) -> tuple[int, list[tuple[str, str, str]]]:
-    """返回 (主表总记录数, 缺向量的 [(prefix, key, value_json), ...])。
+def plan_upgrades(db_path: str) -> tuple[int, list[tuple[str, str, str]]]:
+    """返回 (主表总记录数, 待处理 [(prefix, key, 真实内容), ...])。
 
-    用独立短连接只读扫描，调用方负责在打开可写 SqliteStore 前关闭它，
-    避免 SQLite 写锁冲突。
+    用独立短连接只读扫描；调用方在打开可写 SqliteStore 前关闭它，避免锁冲突。
     """
     conn = sqlite3.connect(db_path)
     try:
-        total = conn.execute("SELECT COUNT(*) FROM store").fetchone()[0]
-        rows = conn.execute("SELECT prefix, key, value FROM store").fetchall()
-        have = {
-            (prefix, key)
-            for prefix, key in conn.execute(
-                "SELECT DISTINCT prefix, key FROM store_vectors"
-            )
-        }
+        rows = conn.execute(
+            f"""
+            SELECT s.prefix, s.key, s.value,
+                   EXISTS (
+                       SELECT 1 FROM store_vectors v
+                       WHERE v.prefix = s.prefix AND v.key = s.key
+                         AND v.field_name = ?
+                   ) AS has_new_vector
+            FROM store s
+            """,
+            (INDEX_TEXT_FIELD,),
+        ).fetchall()
     finally:
         conn.close()
-    missing = [(p, k, v) for (p, k, v) in rows if (p, k) not in have]
-    return total, missing
+
+    pending: list[tuple[str, str, str]] = []
+    for prefix, key, raw_value, has_new_vector in rows:
+        try:
+            record = json.loads(raw_value)
+        except (ValueError, TypeError):
+            print(
+                f"  [跳过] {prefix}/{key}：value 不是合法 JSON 对象",
+                file=sys.stderr,
+            )
+            continue
+        if not isinstance(record, dict) or VALUE_FIELD not in record:
+            print(
+                f"  [跳过] {prefix}/{key}：记录缺少 {VALUE_FIELD!r} 字段",
+                file=sys.stderr,
+            )
+            continue
+        needs_upgrade = INDEX_TEXT_FIELD not in record
+        if needs_upgrade or not has_new_vector:
+            pending.append((prefix, key, str(record[VALUE_FIELD])))
+    return len(rows), pending
+
+
+def purge_legacy_vectors(db_path: str, pairs: list[tuple[str, str]]) -> None:
+    """删除待处理记录残留的非 index_text 向量（用独立连接，避免与 store 写冲突）。"""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executemany(
+            "DELETE FROM store_vectors "
+            "WHERE prefix = ? AND key = ? AND field_name <> ?",
+            [(p, k, INDEX_TEXT_FIELD) for p, k in pairs],
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="为历史记忆批量补语义向量（sqlite-vec）。"
+        description="升级记忆格式（index_text 含 key）并补齐语义向量。"
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="只打印将要补的记忆，不实际写入。",
+        "--dry-run", action="store_true", help="只打印将要处理的记忆，不实际写入。"
     )
     parser.add_argument(
-        "--yes",
-        action="store_true",
-        help="跳过交互确认直接执行。",
+        "--yes", action="store_true", help="跳过交互确认直接执行。"
     )
     return parser.parse_args()
 
@@ -83,13 +116,13 @@ def main() -> int:
         print("未检测到 AGICTO_API_KEY，请先在 .env 配置（模板见 .env.example）。")
         return 1
 
-    total, missing = find_missing_pairs(config.STORE_DB)
-    print(f"记忆主表共 {total} 条；其中缺向量 {len(missing)} 条。")
-    for prefix, key, _ in missing:
+    total, pending = plan_upgrades(config.STORE_DB)
+    print(f"记忆主表共 {total} 条；待升级/补向量 {len(pending)} 条。")
+    for prefix, key, _ in pending:
         print(f"  - namespace={tuple(prefix.split('.'))}  key={key}")
 
-    if not missing:
-        print("没有需要补向量的记忆，结束。")
+    if not pending:
+        print("没有需要处理的记忆，结束。")
         return 0
 
     if args.dry_run:
@@ -98,12 +131,15 @@ def main() -> int:
 
     if not args.yes:
         try:
-            answer = input("\n确认对以上记忆重新写入并生成向量？[y/N] ").strip().lower()
+            answer = input("\n确认升级以上记忆并重新生成向量？[y/N] ").strip().lower()
         except EOFError:
             answer = ""
         if answer not in {"y", "yes"}:
             print("已取消，未做任何改动。")
             return 0
+
+    # 先清旧向量（独立连接），再打开 store 重写
+    purge_legacy_vectors(config.STORE_DB, [(p, k) for p, k, _ in pending])
 
     embeddings = OpenAIEmbeddings(
         model=config.EMBEDDING_MODEL,
@@ -115,20 +151,18 @@ def main() -> int:
         index={
             "dims": config.EMBEDDING_DIMS,
             "embed": embeddings,
-            "text_fields": ["value"],
+            "text_fields": [INDEX_TEXT_FIELD],
         },
     )
 
     ok = 0
     failed = 0
-    # 与 cli.py 相同的方式打开 store（自动注册 sqlite-vec 扩展）
     with store_cm as store:
-        for prefix, key, raw_value in missing:
+        for prefix, key, content in pending:
             namespace = tuple(prefix.split("."))
             try:
-                value = json.loads(raw_value)
-                store.put(namespace, key, value)
-            except Exception as exc:  # noqa: BLE001, PERF203
+                store.put(namespace, key, memory_common.make_record(key, content))
+            except Exception as exc:  # noqa: BLE001
                 failed += 1
                 print(f"  [失败] {namespace} / {key}：{exc}", file=sys.stderr)
             else:

@@ -90,10 +90,13 @@ def fake_store(monkeypatch):
 def test_save_project_fact(fake_store):
     out = save_project_fact.invoke({"key": "test_command", "value": "pytest -q"})
     assert "已记住" in out
-    # 必须建立向量索引
-    assert fake_store.last_index == ["value"]
-    # 落在项目命名空间
-    assert fake_store.get(config.project_namespace(), "test_command") is not None
+    # 依赖全局 text_fields=[index_text]，不再显式传 index
+    assert fake_store.last_index is None
+    # 落在项目命名空间且记录结构正确
+    item = fake_store.get(config.project_namespace(), "test_command")
+    assert item is not None
+    assert item.value["value"] == "pytest -q"
+    assert item.value["index_text"] == "test_command：pytest -q"
 
 
 def test_recall_project_fact_semantic(fake_store):
@@ -163,21 +166,28 @@ class _DeterministicEmbeddings(Embeddings):
 
 
 def test_sqlite_semantic_index_roundtrip(tmp_path):
+    from mycodingagent.memory_common import INDEX_TEXT_FIELD, make_record
+
     db = str(tmp_path / "mem.sqlite")
     with SqliteStore.from_conn_string(
         db,
         index={
             "dims": _DeterministicEmbeddings.dims,
             "embed": _DeterministicEmbeddings(),
-            "text_fields": ["value"],
+            "text_fields": [INDEX_TEXT_FIELD],
         },
     ) as store:
-        store.put(("projects", "x", "facts"), "tests",
-                  {"value": "run tests with pytest command"}, index=["value"])
-        store.put(("projects", "x", "facts"), "deploy",
-                  {"value": "deploy app to production server"}, index=["value"])
-        hits = store.search(
-            ("projects", "x", "facts"), query="pytest command for tests", limit=2
+        ns = ("projects", "x", "facts")
+        store.put(
+            ns, "tests",
+            make_record("tests", "run tests with pytest command"),
+            index=[INDEX_TEXT_FIELD],
         )
+        store.put(
+            ns, "deploy",
+            make_record("deploy", "deploy app to production server"),
+            index=[INDEX_TEXT_FIELD],
+        )
+        hits = store.search(ns, query="pytest command for tests", limit=2)
         assert hits, "语义查询应返回结果"
         assert hits[0].key == "tests"

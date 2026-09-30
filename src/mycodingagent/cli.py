@@ -383,7 +383,8 @@ def main() -> None:
         index={
             "dims": config.EMBEDDING_DIMS,
             "embed": embeddings,
-            "text_fields": ["value"],
+            # 索引含 key 的组合文本字段（key 也能被语义命中），真实内容取 value
+            "text_fields": [memory_common.INDEX_TEXT_FIELD],
         },
     )
     with saver_cm as checkpointer, store_cm as store:
