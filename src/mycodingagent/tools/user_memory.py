@@ -58,3 +58,17 @@ def recall_user_info_list() -> str:
     if not items:
         return "还没有保存任何用户信息"
     return memory_common.format_items(items)
+
+
+@tool
+def delete_user_info(key: str) -> str:
+    """精确删除一条用户长期个人信息（按 key，不可模糊匹配）。
+
+    key 不存在时明确提示，不做任何改动。
+    """
+    store = get_store()
+    result = memory_common.delete_record(store, _USER_NAMESPACE, key)
+    if result is None:
+        return f"没有找到 key 为「{key}」的用户信息，未删除任何内容"
+    deleted_key, original = result
+    return f"已删除用户信息：{deleted_key} = {original}"

@@ -27,12 +27,14 @@ from mycodingagent.tools.calculator import calculate
 from mycodingagent.tools.git_tools import git_commit, git_diff, git_log, git_status
 from mycodingagent.tools.plan import propose_plan
 from mycodingagent.tools.project_memory import (
+    delete_project_fact,
     list_project_facts,
     recall_project_fact,
     save_project_fact,
 )
 from mycodingagent.tools.shell import SafeShellBackend
 from mycodingagent.tools.user_memory import (
+    delete_user_info,
     recall_user_info,
     recall_user_info_list,
     save_user_info,
@@ -162,9 +164,11 @@ def build_deep_agent(checkpointer, store, backend=None):
         save_user_info,
         recall_user_info,
         recall_user_info_list,
+        delete_user_info,
         save_project_fact,
         recall_project_fact,
         list_project_facts,
+        delete_project_fact,
         git_status,
         git_diff,
         git_log,

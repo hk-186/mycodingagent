@@ -57,3 +57,17 @@ def list_project_facts() -> str:
     if not items:
         return "本项目还没有保存任何约定"
     return memory_common.format_items(items)
+
+
+@tool
+def delete_project_fact(key: str) -> str:
+    """精确删除一条当前项目的约定（按 key，不可模糊匹配）。
+
+    key 不存在时明确提示，不做任何改动。
+    """
+    store = get_store()
+    result = memory_common.delete_record(store, config.project_namespace(), key)
+    if result is None:
+        return f"本项目没有找到 key 为「{key}」的约定，未删除任何内容"
+    deleted_key, original = result
+    return f"已删除本项目约定：{deleted_key} = {original}"

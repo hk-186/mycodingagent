@@ -11,6 +11,7 @@ import pytest
 from mycodingagent.tools import memory_common
 from mycodingagent.tools.memory_common import INDEX_TEXT_FIELD, VALUE_FIELD
 from mycodingagent.tools.user_memory import (
+    delete_user_info,
     recall_user_info,
     recall_user_info_list,
     save_user_info,
@@ -91,6 +92,10 @@ class FakeStore:
     def get(self, namespace, key):
         return self._items.get((tuple(namespace), key))
 
+    def delete(self, namespace, key):
+        # 与真实 SqliteStore 一致：只删主表（向量补偿由 delete_record 负责）
+        self._items.pop((tuple(namespace), key), None)
+
     def search(self, namespace, query=None, limit=10, **_kw):
         items = [v for (ns, _k), v in self._items.items() if ns == tuple(namespace)]
         if query is not None:
@@ -153,3 +158,25 @@ def test_recall_list_and_empty(fake_store):
     _seed(fake_store)
     out = recall_user_info_list.invoke({})
     assert "name = Kevin" in out and "learning = 正在学习 LangChain" in out
+
+
+# ============================================================
+# delete_user_info（FakeStore 测流程；向量补偿见 SqliteStore 集成测试）
+# ============================================================
+def test_delete_user_info_success(fake_store):
+    _seed(fake_store)
+    out = delete_user_info.invoke({"key": "name"})
+    assert "已删除" in out and "name = Kevin" in out
+    # 删除后精确取与列表都查不到
+    assert fake_store.get(("users",), "name") is None
+    assert "Kevin" not in recall_user_info_list.invoke({})
+    # 另一条仍在
+    assert "learning" in recall_user_info_list.invoke({})
+
+
+def test_delete_user_info_not_found(fake_store):
+    _seed(fake_store)
+    out = delete_user_info.invoke({"key": "nonexistent"})
+    assert "没有找到" in out and "未删除" in out
+    # 原有数据未受影响
+    assert "name = Kevin" in recall_user_info_list.invoke({})

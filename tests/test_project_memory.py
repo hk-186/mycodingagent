@@ -13,6 +13,7 @@ from langgraph.store.sqlite import SqliteStore
 
 from mycodingagent import config
 from mycodingagent.tools.project_memory import (
+    delete_project_fact,
     list_project_facts,
     recall_project_fact,
     save_project_fact,
@@ -60,6 +61,10 @@ class FakeStore:
 
     def get(self, namespace, key):
         return self._items.get((tuple(namespace), key))
+
+    def delete(self, namespace, key):
+        # 与真实 SqliteStore 一致：只删主表（向量补偿由 delete_record 负责）
+        self._items.pop((tuple(namespace), key), None)
 
     def search(self, namespace, query=None, limit=10, **_kw):
         items = [v for (ns, _k), v in self._items.items() if ns == tuple(namespace)]
@@ -140,6 +145,25 @@ def test_project_facts_isolated_by_namespace(fake_store, monkeypatch, tmp_path):
 
 
 # ============================================================
+# delete_project_fact（FakeStore 测流程；向量补偿见下方 SqliteStore 集成）
+# ============================================================
+def test_delete_project_fact_success(fake_store):
+    save_project_fact.invoke({"key": "a", "value": "aaa"})
+    save_project_fact.invoke({"key": "b", "value": "bbb"})
+    out = delete_project_fact.invoke({"key": "a"})
+    assert "已删除" in out and "a = aaa" in out
+    assert "aaa" not in list_project_facts.invoke({})
+    assert "bbb" in list_project_facts.invoke({})
+
+
+def test_delete_project_fact_not_found(fake_store):
+    save_project_fact.invoke({"key": "a", "value": "aaa"})
+    out = delete_project_fact.invoke({"key": "x"})
+    assert "没有找到" in out and "未删除" in out
+    assert "aaa" in list_project_facts.invoke({})
+
+
+# ============================================================
 # 离线语义索引集成：SqliteStore + 确定性 Embeddings（sqlite-vec）
 # ============================================================
 class _DeterministicEmbeddings(Embeddings):
@@ -191,3 +215,60 @@ def test_sqlite_semantic_index_roundtrip(tmp_path):
         hits = store.search(ns, query="pytest command for tests", limit=2)
         assert hits, "语义查询应返回结果"
         assert hits[0].key == "tests"
+
+
+def test_sqlite_delete_record_cleans_vector(tmp_path):
+    """真实 SqliteStore：delete_record 必须同时删除主表记录与残留向量。
+
+    先证明框架的 store.delete 只删主表、向量残留（外键级联未启用），
+    再验证 delete_record 的补偿删除生效。
+    """
+    import sqlite3
+
+    from mycodingagent.tools import memory_common
+    from mycodingagent.tools.memory_common import INDEX_TEXT_FIELD, make_record
+
+    db = str(tmp_path / "mem.sqlite")
+    with SqliteStore.from_conn_string(
+        db,
+        index={
+            "dims": _DeterministicEmbeddings.dims,
+            "embed": _DeterministicEmbeddings(),
+            "text_fields": [INDEX_TEXT_FIELD],
+        },
+    ) as store:
+        ns = ("projects", "z", "facts")
+        store.put(ns, "k", make_record("k", "some content here"),
+                  index=[INDEX_TEXT_FIELD])
+
+        def vector_count():
+            return store.conn.execute(
+                "SELECT COUNT(*) FROM store_vectors WHERE prefix=? AND key=?",
+                (".".join(ns), "k"),
+            ).fetchone()[0]
+
+        assert vector_count() == 1
+
+        # 框架的 delete：主表删除但向量残留（证明补偿必要）
+        store.delete(ns, "k")
+        assert store.get(ns, "k") is None
+        assert vector_count() == 1
+
+        # 重新写入，再用 delete_record：主表 + 向量一并清除
+        store.put(ns, "k", make_record("k", "some content here"),
+                  index=[INDEX_TEXT_FIELD])
+        result = memory_common.delete_record(store, ns, "k")
+        assert result == ("k", "some content here")
+        assert store.get(ns, "k") is None
+        assert vector_count() == 0
+
+        # 不存在的 key 返回 None
+        assert memory_common.delete_record(store, ns, "missing") is None
+
+    # 连接关闭后用独立连接复核：向量确实落盘删除
+    conn = sqlite3.connect(db)
+    n = conn.execute(
+        "SELECT COUNT(*) FROM store_vectors WHERE prefix=?", ("projects.z.facts",)
+    ).fetchone()[0]
+    conn.close()
+    assert n == 0

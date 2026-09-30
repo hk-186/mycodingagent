@@ -69,3 +69,30 @@ def match_record_keys(query: str, items: Iterable[_ItemLike]) -> list[_ItemLike]
 def format_items(items: Iterable[_ItemLike]) -> str:
     """把条目拼成 'key = value；...' 的展示文本（只取真实内容字段）。"""
     return "；".join(f"{item.key} = {record_value(item.value)}" for item in items)
+
+
+def delete_record(
+    store: Any, namespace: tuple[str, ...], key: str
+) -> tuple[str, str] | None:
+    """精确删除一条记忆，并补偿清理其向量。
+
+    返回 (key, 被删内容)；key 不存在时返回 None（不报错、不静默改动）。
+
+    补偿说明：SqliteStore 的 delete 只删 store 主表；store_vectors 虽对主表
+    声明了 ON DELETE CASCADE，但连接未启用 PRAGMA foreign_keys，级联不生效。
+    因此通过 store.conn（SqliteStore 实例属性）显式删除对应向量。
+    """
+    item = store.get(namespace, key)
+    if item is None:
+        return None
+    original = record_value(item.value)
+    store.delete(namespace, key)
+    conn = getattr(store, "conn", None)
+    if conn is not None:
+        prefix = ".".join(namespace)
+        conn.execute(
+            "DELETE FROM store_vectors WHERE prefix = ? AND key = ?",
+            (prefix, key),
+        )
+        conn.commit()
+    return key, original
