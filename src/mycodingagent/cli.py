@@ -34,7 +34,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.store.sqlite import SqliteStore
 from langchain_openai import OpenAIEmbeddings
 
-from mycodingagent import config
+from mycodingagent import config, memory_common
 from mycodingagent.agent import build_deep_agent
 from mycodingagent.tools.shell import SafeShellBackend
 from mycodingagent.events import (
