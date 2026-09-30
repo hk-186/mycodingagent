@@ -10,6 +10,7 @@ import logging
 import platform
 import sys
 from datetime import datetime
+from pathlib import Path
 
 from langchain.agents.middleware import TodoListMiddleware  # write_todos 工具 + todos 状态
 from langchain.agents.middleware import InterruptOnConfig
@@ -52,6 +53,29 @@ def get_llm() -> ChatOpenAI:
         temperature=config.LLM_TEMPERATURE,
         timeout=config.LLM_TIMEOUT,
         max_retries=config.LLM_MAX_RETRIES,
+    )
+
+
+# ============================================================
+# 用户级记忆：从 ~/.mycodingagent/MEMORY.md 只读加载（对标 ~/.claude/CLAUDE.md）
+# ============================================================
+def _read_optional_text(path: Path) -> str:
+    """读取文本；文件缺失/不可读时返回空字符串（安全降级，不抛异常）。"""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        logger.warning("未能读取用户级记忆文件：%s", path)
+        return ""
+
+
+def _user_memory_block(path: Path | None = None) -> str:
+    """读取用户级 MEMORY.md 并构造注入段落；为空/缺失则不注入（连标题也不加）。"""
+    mem_path = path or Path.home() / ".mycodingagent" / "MEMORY.md"
+    text = _read_optional_text(mem_path)
+    if not text.strip():
+        return ""
+    return (
+        "\n\n## 用户级记忆（跨项目，来自 ~/.mycodingagent/MEMORY.md）\n" + text
     )
 
 
@@ -327,6 +351,7 @@ def build_deep_agent(checkpointer, store, backend=None):
             "重新验证，【确认通过】后再向用户汇报。\n"
             "- 用户要求补测试，或改动缺少测试覆盖时，用 task 委派 test-writer "
             "获取测试方案，由你负责落地并跑通。\n"
+            + _user_memory_block()
         ),
         checkpointer=checkpointer,  # 短期记忆：对话历史按 thread_id 持久化
         store=store,  # 长期记忆：个人/项目记忆工具读写它
