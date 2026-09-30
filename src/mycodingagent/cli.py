@@ -7,10 +7,12 @@
     python -m mycodingagent       # 等价写法
 
 会话命令：
-    /new [名字]  开启新会话（旧会话历史保留在磁盘）
-    /memory      查看长期记忆（store 中保存的用户信息）
-    /history     查看当前会话的消息统计
-    /exit        退出
+    /sessions             列出所有历史会话
+    /switch <id|序号>     切换到指定会话（序号来自 /sessions 列表）
+    /new [名字]           开启新会话（旧会话历史保留在磁盘）
+    /memory               查看长期记忆（store 中保存的用户信息）
+    /history              查看当前会话的消息统计
+    /exit                 退出
 """
 
 import argparse
@@ -67,10 +69,14 @@ def run_task(agent, user_input: str, thread_id: str = "main") -> None:
 # ============================================================
 # 交互模式
 # ============================================================
-def chat(agent, store) -> None:
+def chat(agent, store, checkpointer) -> None:
     thread_id = "main"  # 默认会话固定 id：重启进程后可接着聊（短期记忆持久化）
     print(f"模型: {config.MODEL_NAME} | 会话: {thread_id} | 项目目录: {config.PROJECT_DIR}")
     print("输入 /help 查看命令，/exit 退出\n")
+
+    # 工具函数：根据 thread_id 拿 StateSnapshot
+    def get_state(tid: str):
+        return agent.get_state({"configurable": {"thread_id": tid}})
 
     while True:
         try:
@@ -87,13 +93,31 @@ def chat(agent, store) -> None:
             if cmd == "/exit":
                 break
             elif cmd == "/help":
-                print("  /new [名字]  开启新会话（旧会话历史保留）")
-                print("  /memory      查看长期记忆中保存的用户信息")
-                print("  /history     查看当前会话的消息统计")
-                print("  /exit        退出")
+                print("  /sessions             列出所有历史会话")
+                print("  /switch <id|序号>     切换到指定会话")
+                print("  /new [名字]           开启新会话（旧会话历史保留）")
+                print("  /memory               查看长期记忆中保存的用户信息")
+                print("  /history              查看当前会话的消息统计")
+                print("  /exit                 退出")
             elif cmd == "/new":
                 thread_id = arg.strip() or f"session-{datetime.now():%Y%m%d-%H%M%S}"
                 print(f"[已切换到新会话: {thread_id}]")
+            elif cmd == "/sessions":
+                from mycodingagent.sessions import list_sessions, format_sessions
+                sessions = list_sessions(checkpointer.conn, get_state)
+                print(format_sessions(sessions))
+            elif cmd == "/switch":
+                from mycodingagent.sessions import list_sessions, resolve_switch_arg
+                sessions = list_sessions(checkpointer.conn, get_state)
+                new_tid = resolve_switch_arg(arg, sessions)
+                if new_tid is None:
+                    print(f"[找不到会话: {arg or '(空)'}，输入 /sessions 查看可用会话]")
+                else:
+                    thread_id = new_tid
+                    state = get_state(thread_id)
+                    n = len(state.values.get("messages", [])) if state.values else 0
+                    status = "中断" if state.next else "等待输入"
+                    print(f"[已切换到会话: {thread_id}]  ({n} 条消息, {status})")
             elif cmd == "/memory":
                 items = store.search(("users",))
                 if not items:
@@ -149,7 +173,7 @@ def main() -> None:
     store_cm = SqliteStore.from_conn_string(config.STORE_DB)
     with saver_cm as checkpointer, store_cm as store:
         agent = build_deep_agent(checkpointer, store)
-        chat(agent, store)
+        chat(agent, store, checkpointer)
 
     print("再见！对话历史、长期记忆和文件都已保存，下次启动依然有效。")
 
