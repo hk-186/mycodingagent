@@ -10,6 +10,7 @@
 """
 
 import os
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -91,6 +92,14 @@ CHECKPOINT_DB = str(PROJECT_ROOT / "agent_state.sqlite")  # 短期记忆：对�
 STORE_DB = str(PROJECT_ROOT / "agent_memory.sqlite")  # 长期记忆：用户信息
 
 # ------------------------------------------------------------
+# 阶段 5：语义索引配置（C13：长期记忆查询用 store 索引能力）
+# SqliteStore 构造时传入 index={"embed": Embeddings, "dims": ..., "text_fields": ...}，
+# 记忆写入后自动生成向量，recall 用自然语言语义检索（sqlite-vec 扩展）。
+# ------------------------------------------------------------
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_DIMS = int(os.getenv("EMBEDDING_DIMS", "1536"))
+
+# ------------------------------------------------------------
 # 工作目标目录（阶段 1：从固定 workspace 改为可指定任意项目目录）
 # 优先级：CLI --project 参数 > 环境变量 AGENT_PROJECT_DIR > 默认 workspace/
 # CLI 通过 set_project_dir() 在构建 Agent 前切换。
@@ -112,3 +121,15 @@ def set_project_dir(path: str | Path) -> None:
     if not resolved.is_dir():
         raise NotADirectoryError(f"项目目录不存在：{resolved}")
     PROJECT_DIR = resolved
+
+
+# ------------------------------------------------------------
+# 阶段 5：项目级记忆的命名空间
+# 个人全局信息固定存 ("users",)；项目约定存
+# ("projects", <项目路径 slug>, "facts")，不同项目互不串扰。
+# 每次调用动态读取 PROJECT_DIR，/cd 切换后自动指向新命名空间。
+# ------------------------------------------------------------
+def project_namespace() -> tuple[str, ...]:
+    """返回当前项目的长期记忆命名空间。"""
+    slug = re.sub(r"[^a-z0-9]+", "_", str(PROJECT_DIR).lower()).strip("_")
+    return ("projects", slug, "facts")

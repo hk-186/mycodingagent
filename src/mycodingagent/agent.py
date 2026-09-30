@@ -21,11 +21,16 @@ from deepagents import create_deep_agent
 
 from mycodingagent import config
 from mycodingagent.approvals import should_interrupt_command
+from mycodingagent.project_middleware import ProjectMemoryMiddleware
 from mycodingagent.prompt_runtime import RuntimePromptMiddleware
 from mycodingagent.tools.ask_user import ask_user
-from mycodingagent.tools.calculator import calculate
 from mycodingagent.tools.git_tools import git_commit, git_diff, git_log, git_status
 from mycodingagent.tools.plan import propose_plan
+from mycodingagent.tools.project_memory import (
+    list_project_facts,
+    recall_project_fact,
+    save_project_fact,
+)
 from mycodingagent.tools.shell import SafeShellBackend
 
 logger = logging.getLogger(__name__)
@@ -59,31 +64,32 @@ def get_current_time() -> str:
 # ============================================================
 @tool
 def save_user_info(key: str, value: str) -> str:
-    """保存用户的长期信息。key 是信息类别（如 name、age、hobby），value 是具体内容"""
+    """保存用户的长期个人信息（跨项目共享）。key 是信息类别（如 name、email、hobby），value 是具体内容"""
     store = get_store()
-    store.put(("users",), key, {"value": value})
+    store.put(("users",), key, {"value": value}, index=["value"])
     return f"已记住：{key} = {value}"
 
 
 @tool
-def recall_user_info(key: str) -> str:
-    """回忆用户的长期信息。key 是信息类别（如 name、age、hobby），不确定时可用 recall_user_info_list"""
+def recall_user_info(query: str) -> str:
+    """回忆用户的长期个人信息，可用精确类别名或自然语言描述（语义检索）。
+
+    项目相关的约定请用 recall_project_fact。
+    """
     store = get_store()
-    item = store.get(("users",), key)
-    if item is None:
-        # 精确 key 没找到时，本地模糊匹配一遍，提升召回率
-        hits = [
-            i for i in store.search(("users",)) if key in i.key or key in str(i.value)
-        ]
-        if hits:
-            return "；".join(f"{h.key} = {h.value['value']}" for h in hits)
-        return f"没有找到 {key} 相关的记忆"
-    return f"{key} = {item.value['value']}"
+    # 先精确按 key 取；找不到再走语义索引（不再全量扫描，C13）
+    item = store.get(("users",), query)
+    if item is not None:
+        return f"{query} = {item.value['value']}"
+    hits = store.search(("users",), query=query, limit=5)
+    if hits:
+        return "；".join(f"{h.key} = {h.value['value']}" for h in hits)
+    return f"没有找到与「{query}」相关的记忆"
 
 
 @tool
 def recall_user_info_list() -> str:
-    """列出所有已保存的用户长期信息"""
+    """列出所有已保存的用户长期信息（显式列举，非模糊查询）"""
     store = get_store()
     items = store.search(("users",))
     if not items:
@@ -182,13 +188,16 @@ def build_deep_agent(checkpointer, store, backend=None):
     if backend is None:
         backend = SafeShellBackend(root_dir=str(config.PROJECT_DIR), inherit_env=True)
 
-    # 主 Agent 的工具：时间 + 长期记忆读写 + Git 工具 + ask_user + propose_plan
+    # 主 Agent 的工具：时间 + 个人记忆 + 项目记忆 + Git 工具 + ask_user + propose_plan
     # （+ 设置了密钥时的联网搜索）
     tools = [
         get_current_time,
         save_user_info,
         recall_user_info,
         recall_user_info_list,
+        save_project_fact,
+        recall_project_fact,
+        list_project_facts,
         git_status,
         git_diff,
         git_log,
@@ -228,29 +237,58 @@ def build_deep_agent(checkpointer, store, backend=None):
         ),
     }
 
-    # 子代理：专门负责数学计算，拥有独立的工具集和系统提示词
-    # 显式 interrupt_on={} 避免继承父级审批配置（Plan agent 验证建议）
-    calculator_subagent = {
-        "name": "calculator",
+    # 阶段 5 子代理：code-reviewer（改动后审查）、test-writer（补测试）
+    # 两个子代理都只读（不给写工具），输出结构化意见由主 Agent 决定是否采纳；
+    # 显式 interrupt_on={} 避免继承父级审批配置。
+    code_reviewer_subagent = {
+        "name": "code-reviewer",
         "description": (
-            "数学计算专家。任何需要精确计算的问题都委派给它，"
-            "例如四则运算、百分比、乘方。输入完整的数学表达式。"
+            "代码审查专家。主 Agent 完成代码改动并验证通过后，把本次改动的文件"
+            "或 git diff 交给它审查：正确性、边界情况、可维护性、潜在 bug 与"
+            "安全风险。输入应说明改了哪些文件、任务目标是什么。"
         ),
-        "tools": [calculate],
         "model": llm,
         "system_prompt": (
-            "你是数学计算专家。收到表达式后必须调用 calculate 工具计算，"
-            "禁止心算。用中文简要返回计算结果。"
+            "你是资深代码审查专家，只读不改。收到审查请求后：\n"
+            "1. 用 read_file / grep / glob / ls 查看相关改动与上下文，必要时用 "
+            "execute 运行测试验证；不要修改任何文件。\n"
+            "2. 输出结构化中文审查意见，按严重度分组：\n"
+            "   - 【必须修改】明确的 bug、安全问题、会导致失败的错误（给出文件与原因）\n"
+            "   - 【建议改进】可维护性、可读性、设计取舍\n"
+            "   - 【确认通过】没有严重问题时明确说明\n"
+            "3. 只报告有依据的问题，禁止泛泛而谈或编造；没有问题就直接说通过。"
         ),
-        "interrupt_on": {},  # 子代理禁用审批继承
+        "interrupt_on": {},
+    }
+
+    test_writer_subagent = {
+        "name": "test-writer",
+        "description": (
+            "测试编写专家。需要为新功能/改动补充测试时委派给它：分析目标代码的"
+            "行为与边界，给出应补充的测试用例清单和完整测试代码建议。"
+        ),
+        "model": llm,
+        "system_prompt": (
+            "你是测试工程师专家，只读分析并产出测试方案。收到请求后：\n"
+            "1. 用 read_file / grep / glob 看清目标代码与现有测试的组织方式、"
+            "框架与命名约定；不要修改任何文件。\n"
+            "2. 输出中文测试方案：正常路径、边界值、异常路径各应覆盖哪些 case；\n"
+            "3. 给出符合项目现有风格的完整测试代码建议，并说明放在哪个文件；\n"
+            "4. 只针对本次改动相关的行为设计用例，不堆砌无关测试。"
+        ),
+        "interrupt_on": {},
     }
 
     agent = create_deep_agent(
         model=llm,
         tools=tools,
         backend=backend,
-        middleware=[TodoListMiddleware(), RuntimePromptMiddleware()],
-        subagents=[calculator_subagent],   # 注册子代理 → 主 Agent 获得 task 工具
+        middleware=[
+            TodoListMiddleware(),
+            ProjectMemoryMiddleware(backend=backend),  # AGENTS.md：/cd 后跟随重载
+            RuntimePromptMiddleware(),
+        ],
+        subagents=[code_reviewer_subagent, test_writer_subagent],
         interrupt_on=interrupt_on_config,
         system_prompt=(
             "你是 mycodingagent，一个在用户真实仓库里工作的 coding agent。\n"
@@ -304,9 +342,22 @@ def build_deep_agent(checkpointer, store, backend=None):
             "- Plan 模式由用户用 CLI /plan 命令显式开启；开启时所有写操作"
             "自动拦截，你应该先调研代码后调用 propose_plan 提交计划等审批。\n"
             "__PLAN_MODE_SUFFIX__"
+            "\n## 记忆与多代理协作（阶段 5）\n"
+            "- 两层长期记忆：个人信息（姓名/邮箱等跨项目属性）用 "
+            "save_user_info / recall_user_info；项目约定（测试命令、代码风格、"
+            "架构决策）用 save_project_fact / recall_project_fact，项目约定按项目"
+            "隔离，不要混用。\n"
+            "- 发现项目特有的约定或用户纠正了你的工作方式时，主动用 "
+            "save_project_fact 记下来，让后续会话能延续。\n"
+            "- 项目根目录的 AGENTS.md 会自动加载（若存在）；把它视为项目规则"
+            "参考，与用户明确指令冲突时以用户为准。\n"
+            "- 代码改动并验证通过后，必须用 task 工具委派 code-reviewer 审查"
+            "本次改动（说明任务目标与改动文件）；收到【必须修改】意见要处理后"
+            "重新验证，【确认通过】后再向用户汇报。\n"
+            "- 用户要求补测试，或改动缺少测试覆盖时，用 task 委派 test-writer "
+            "获取测试方案，由你负责落地并跑通。\n"
         ),
-        memory=["/AGENTS.md"],  # 规则型记忆：AGENTS.md 内容每轮注入 system prompt
         checkpointer=checkpointer,  # 短期记忆：对话历史按 thread_id 持久化
-        store=store,  # 长期记忆：save/recall_user_info 工具读写它
+        store=store,  # 长期记忆：个人/项目记忆工具读写它
     )
     return agent

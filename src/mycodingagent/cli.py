@@ -32,6 +32,7 @@ from pathlib import Path
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.store.sqlite import SqliteStore
+from langchain_openai import OpenAIEmbeddings
 
 from mycodingagent import config
 from mycodingagent.agent import build_deep_agent
@@ -369,8 +370,22 @@ def main() -> None:
 
     # SqliteSaver = 短期记忆（对话历史）  SqliteStore = 长期记忆（用户信息）
     # with 同时管理两个 sqlite 连接的生命周期
+    # 阶段 5：SqliteStore 配置语义向量索引（C13）——记忆写入时自动 embed，
+    # recall 走 store 语义检索而非全量扫描（依赖 sqlite-vec）。
     saver_cm = SqliteSaver.from_conn_string(config.CHECKPOINT_DB)
-    store_cm = SqliteStore.from_conn_string(config.STORE_DB)
+    embeddings = OpenAIEmbeddings(
+        model=config.EMBEDDING_MODEL,
+        api_key=config.API_KEY,
+        base_url=config.BASE_URL,
+    )
+    store_cm = SqliteStore.from_conn_string(
+        config.STORE_DB,
+        index={
+            "dims": config.EMBEDDING_DIMS,
+            "embed": embeddings,
+            "text_fields": ["value"],
+        },
+    )
     with saver_cm as checkpointer, store_cm as store:
         # backend 提前构造并注入 agent，CLI 才能在运行时 /cd 切换同一实例的目录
         backend = SafeShellBackend(
