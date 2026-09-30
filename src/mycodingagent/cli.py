@@ -13,6 +13,10 @@
     /resume               从最近一次中断/超限的断点继续当前会话的任务
     /memory               查看长期记忆（store 中保存的用户信息）
     /history              查看当前会话的消息统计
+    /plan <task>          进入 Plan 模式执行任务（先输出计划等审批）
+    /approve              审批通过当前 INTERRUPT 事件的所有 action_request
+    /reject <reason>      拒绝当前 INTERRUPT，reason 可选
+    /respond <text>       用 respond 决策回答 ask_user 工具的问题
     /exit                 退出
 """
 
@@ -26,15 +30,102 @@ from langgraph.store.sqlite import SqliteStore
 
 from mycodingagent import config
 from mycodingagent.agent import build_deep_agent
-from mycodingagent.events import iter_task_events, render_event
+from mycodingagent.events import (
+    INTERRUPT,
+    SUMMARY,
+    AgentEvent,
+    iter_task_events,
+    render_event,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# 运行一轮任务：消费结构化事件流并渲染到终端（阶段 2）
+# 阶段 3：HITL 决策收集
+# 把用户的 CLI 输入解析成 deepagents `Decision` dict 形式。
+# 单 action_request 场景：用户输入单条决策；
+# 多 action_request 场景：逐个询问，构造等长 decisions 列表。
+# ============================================================
+def _parse_decision_input(text: str) -> dict | None:
+    """把用户输入解析成 Decision dict，无效返回 None。
+
+    支持形式：
+      /approve             -> {"type": "approve"}
+      /reject [<reason>]   -> {"type": "reject", "message": <reason>} (reason 可选)
+      /respond <text>      -> {"type": "respond", "message": <text>}
+      a / r <reason> / rr <text>   —— 简写
+    """
+    text = text.strip()
+    if not text:
+        return None
+    # 命令形式
+    if text.startswith("/"):
+        cmd, _, arg = text.partition(" ")
+        cmd = cmd.lower()
+        if cmd == "/approve":
+            return {"type": "approve"}
+        if cmd == "/reject":
+            return {"type": "reject", "message": arg.strip()} if arg.strip() else {"type": "reject"}
+        if cmd == "/respond":
+            if not arg.strip():
+                print("[/respond 需要回答内容，例如：/respond 是的，请按方案 A]")
+                return None
+            return {"type": "respond", "message": arg.strip()}
+        print(f"[未知决策命令 {cmd}，可用：/approve /reject [<reason>] /respond <text>]")
+        return None
+    # 简写形式
+    low = text.lower()
+    if low in {"a", "y", "yes"}:
+        return {"type": "approve"}
+    if low in {"r", "n", "no"}:
+        return {"type": "reject"}
+    if low.startswith("rr "):
+        return {"type": "respond", "message": text[3:].strip()}
+    if low.startswith("r "):
+        return {"type": "reject", "message": text[2:].strip()}
+    # 默认当成 respond（适合 ask_user 场景）
+    return {"type": "respond", "message": text}
+
+
+def _collect_decisions_for_interrupt(ev: AgentEvent) -> list[dict] | None:
+    """对 INTERRUPT 事件的 action_requests 逐个收集用户决策。
+
+    返回与 action_requests 等长的 decisions 列表；
+    用户输入空行 / 无效 / Ctrl+C 返回 None 表示取消本轮。
+    """
+    n = len(ev.action_requests)
+    if n == 0:
+        return []
+    decisions: list[dict] = []
+    for i, ar in enumerate(ev.action_requests, 1):
+        name = ar.get("name", "")
+        desc = ar.get("description", "")
+        print(f"\n[{i}/{n}] 工具: {name}")
+        if desc:
+            print(desc)
+        while True:
+            try:
+                user_input = input("决策> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return None
+            if user_input in {"cancel", "abort", "/cancel"}:
+                return None
+            decision = _parse_decision_input(user_input)
+            if decision is not None:
+                decisions.append(decision)
+                break
+            # 无效输入：循环再问
+    return decisions
+
+
+# ============================================================
+# 运行一轮任务：消费结构化事件流并渲染到终端（阶段 2 + 阶段 3 HITL）
 # 事件转换与三重预算（recursion_limit / 步数 / token）都在
-# events.iter_task_events 内完成，这里只做展示。
+# events.iter_task_events 内完成；HITL interrupt 在本函数循环处理：
+#   渲染 → 遇 INTERRUPT 停下 → 收集 decisions → 调 iter_task_events(resume_decisions=...)
+#   循环直到收到 summary 事件。
 # ============================================================
 def run_task(
     agent,
@@ -42,17 +133,64 @@ def run_task(
     thread_id: str = "main",
     *,
     resume: bool = False,
+    plan_mode: bool = False,
 ) -> None:
     shown = "(从上次断点继续)" if resume else user_input
-    title = "续跑>" if resume else "任务>"
+    title = "续跑>" if resume else ("Plan>" if plan_mode else "任务>")
     print(f"\n{'='*60}\n{title} {shown}  [会话: {thread_id}]\n{'='*60}")
+
+    # 第一轮参数
+    next_user_input: str | None = None if resume else user_input
+    next_resume_decisions: list[dict] | None = None
+
     try:
-        for event in iter_task_events(
-            agent,
-            thread_id=thread_id,
-            user_input=None if resume else user_input,
-        ):
-            print(render_event(event), flush=True)
+        while True:
+            # 事件流：渲染并检测 INTERRUPT
+            interrupt_event: AgentEvent | None = None
+            got_summary = False
+            for event in iter_task_events(
+                agent,
+                thread_id=thread_id,
+                user_input=next_user_input,
+                resume_decisions=next_resume_decisions,
+            ):
+                print(render_event(event), flush=True)
+                if event.type == INTERRUPT:
+                    interrupt_event = event
+                elif event.type == SUMMARY:
+                    got_summary = True
+
+            # 没遇到 INTERRUPT 且收到 summary：本轮结束
+            if interrupt_event is None:
+                if not got_summary:
+                    # 兜底：事件流没有正常收尾
+                    print("[!] 任务流未产出 summary 事件（异常）")
+                break
+
+            # 遇到 INTERRUPT：收集用户决策
+            decisions = _collect_decisions_for_interrupt(interrupt_event)
+            if decisions is None:
+                print("[已取消本轮审批，输入 /resume 可从断点继续]")
+                break
+            if len(decisions) != len(interrupt_event.action_requests):
+                print(
+                    f"[决策数量不匹配：需要 {len(interrupt_event.action_requests)} 个，"
+                    f"收到 {len(decisions)} 个。审批未提交，输入 /resume 可重新审批]"
+                )
+                break
+
+            # propose_plan 被 approve 后解除 Plan 模式
+            if plan_mode and any(
+                ar.get("name") == "propose_plan" for ar in interrupt_event.action_requests
+            ):
+                if any(d.get("type") == "approve" for d in decisions):
+                    config.set_plan_mode(False)
+                    plan_mode = False
+                    print("[Plan 模式已解除，开始执行]")
+
+            # 下一轮：用 decisions resume，不再传 user_input
+            next_user_input = None
+            next_resume_decisions = decisions
     except KeyboardInterrupt:
         print("\n[已中断] 输入 /resume 可从断点继续。")
 
@@ -63,6 +201,7 @@ def run_task(
 def chat(agent, store, checkpointer) -> None:
     thread_id = "main"  # 默认会话固定 id：重启进程后可接着聊（短期记忆持久化）
     print(f"模型: {config.MODEL_NAME} | 会话: {thread_id} | 项目目录: {config.PROJECT_DIR}")
+    print(f"审批模式: {config.APPROVAL_MODE} | Plan 模式: {'开启' if config.PLAN_MODE else '关闭'}")
     print("输入 /help 查看命令，/exit 退出\n")
 
     # 工具函数：根据 thread_id 拿 StateSnapshot
@@ -90,6 +229,10 @@ def chat(agent, store, checkpointer) -> None:
                 print("  /resume               从断点继续当前会话中断的任务")
                 print("  /memory               查看长期记忆中保存的用户信息")
                 print("  /history              查看当前会话的消息统计")
+                print("  /plan <task>          进入 Plan 模式执行任务")
+                print("  /approve              在 INTERRUPT 状态下审批通过")
+                print("  /reject [<reason>]    拒绝当前审批，可附原因")
+                print("  /respond <text>       用 respond 决策回答 ask_user 工具的问题")
                 print("  /exit                 退出")
             elif cmd == "/resume":
                 state = get_state(thread_id)
@@ -130,6 +273,18 @@ def chat(agent, store, checkpointer) -> None:
                 print(
                     f"[会话 {thread_id} 共 {n} 条消息（已持久化到 {config.CHECKPOINT_DB}）]"
                 )
+            elif cmd == "/plan":
+                task = arg.strip()
+                if not task:
+                    print("[/plan 需要任务说明，例如：/plan 给 utils.py 加 is_palindrome 函数]")
+                else:
+                    config.set_plan_mode(True)
+                    try:
+                        run_task(agent, task, thread_id, plan_mode=True)
+                    finally:
+                        # 兜底：若任务结束（含异常）Plan 模式仍开启则关闭
+                        if config.PLAN_MODE:
+                            config.set_plan_mode(False)
             else:
                 print(f"[未知命令 {cmd}，输入 /help 查看命令]")
             continue

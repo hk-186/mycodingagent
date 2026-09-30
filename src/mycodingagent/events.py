@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-结构化事件流（阶段 2）
-======================
+结构化事件流（阶段 2 起，阶段 3 扩展）
+======================================
 把 LangGraph 的流式更新（stream_mode="updates"）转换为统一的 AgentEvent
-事件序列：tool_start / tool_end / assistant_message / error / summary。
+事件序列：tool_start / tool_end / assistant_message / error / summary / interrupt。
 
 CLI 只负责渲染事件；后续 TUI / API(SSE) 可直接复用同一事件流（缺口 C12）。
 
@@ -14,16 +14,24 @@ CLI 只负责渲染事件；后续 TUI / API(SSE) 可直接复用同一事件流
     3. token 预算：累计本轮 AI 消息 usage_metadata.total_tokens。
 
 超限/中断时图状态保留在 checkpoint（state.next 非空），配合 /resume 续跑。
+
+阶段 3 扩展：
+- `INTERRUPT` 事件：deepagents `HumanInTheLoopMiddleware` 通过
+  `langgraph.types.interrupt(HITLRequest)` 暂停图后，本层用
+  `agent.get_state(config).interrupts` 检测并产出 INTERRUPT 事件；
+- `resume_decisions` 参数：CLI 收集用户 Decision 列表后传回，本层用
+  `Command(resume=HITLResponse(decisions=...))` 让图从断点继续。
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Iterator
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
+from langgraph.types import Command
 
 from mycodingagent import config
 
@@ -37,6 +45,7 @@ TOOL_END = "tool_end"
 ASSISTANT_MESSAGE = "assistant_message"
 ERROR = "error"
 SUMMARY = "summary"
+INTERRUPT = "interrupt"  # 阶段 3：HITL 审批请求
 
 STOP_COMPLETED = "completed"              # 任务自然完成
 STOP_STEP_LIMIT = "step_limit"            # 达到步数上限
@@ -44,6 +53,7 @@ STOP_TOKEN_LIMIT = "token_limit"          # 达到 token 预算
 STOP_RECURSION_LIMIT = "recursion_limit"  # 达到 LangGraph recursion_limit
 STOP_INTERRUPTED = "interrupted"          # 用户 Ctrl+C 中断
 STOP_ERROR = "error"                      # 执行异常
+STOP_PENDING_INTERRUPT = "pending_interrupt"  # 阶段 3：等待 HITL 决策
 
 
 @dataclass
@@ -53,11 +63,16 @@ class AgentEvent:
     type: str
     name: str = ""            # 工具名（tool_start / tool_end）
     args_preview: str = ""    # 工具参数预览（tool_start）
-    text: str = ""            # 正文（assistant_message / error）
+    text: str = ""            # 正文（assistant_message / error / interrupt description）
     is_error: bool = False    # 工具是否执行失败（tool_end）
     steps: int = 0            # 本轮模型步数（summary）
     tokens: int = 0           # 本轮累计 token（summary）
     stopped_reason: str = ""  # 停止原因（summary）
+    # 阶段 3：INTERRUPT 事件携带的待审批 action_requests 列表。
+    # 每个元素是 {"name": str, "args": dict, "description": str}；
+    # CLI 用它渲染审批提示，收集等长 decisions 列表回传。
+    action_requests: list[dict[str, Any]] = field(default_factory=list)
+    interrupt_id: str = ""    # INTERRUPT 事件对应的 LangGraph Interrupt.id
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为 plain dict（为 API/SSE 输出做准备）。"""
@@ -99,13 +114,63 @@ def _truncate(text: str, limit: int) -> str:
 
 
 # ============================================================
-# 核心：任务执行 → 事件流（含预算执行）
+# 阶段 3：HITL interrupt 检测
+# ============================================================
+def detect_pending_interrupt(agent: Any, cfg: dict[str, Any]) -> Any:
+    """检查图当前是否有未解决的 HITL interrupt 待审批。
+
+    通过 `agent.get_state(cfg).interrupts` 读取（LangGraph 1.x 稳定 API）。
+    返回第一个未解决的 `Interrupt` 对象（其 `.value` 是 HITLRequest）；
+    没有 interrupt 时返回 None。
+
+    抽成纯函数便于单测：FakeAgent 暴露 `get_state()` 返回 mock StateSnapshot。
+    """
+    try:
+        snapshot = agent.get_state(cfg)
+    except Exception:  # noqa: BLE001
+        return None
+    interrupts = getattr(snapshot, "interrupts", ()) or ()
+    return interrupts[0] if interrupts else None
+
+
+def _action_request_to_dict(action_request: Any) -> dict[str, Any]:
+    """把 ActionRequest TypedDict 转成纯 dict（便于序列化与渲染）。"""
+    if isinstance(action_request, dict):
+        return {
+            "name": action_request.get("name", ""),
+            "args": action_request.get("args", {}) or {},
+            "description": action_request.get("description", "") or "",
+        }
+    # 容错：dict-like 对象
+    return {
+        "name": getattr(action_request, "name", "") or "",
+        "args": dict(getattr(action_request, "args", {}) or {}),
+        "description": getattr(action_request, "description", "") or "",
+    }
+
+
+def _hitl_request_action_requests(interrupt_obj: Any) -> list[dict[str, Any]]:
+    """从 Interrupt.value（HITLRequest）提取 action_requests 列表。"""
+    value = getattr(interrupt_obj, "value", None)
+    if value is None:
+        return []
+    # HITLRequest 是 TypedDict {"action_requests": list[ActionRequest], "review_configs": ...}
+    if isinstance(value, dict):
+        raw = value.get("action_requests", []) or []
+    else:
+        raw = getattr(value, "action_requests", []) or []
+    return [_action_request_to_dict(ar) for ar in raw]
+
+
+# ============================================================
+# 核心：任务执行 → 事件流（含预算执行 + HITL）
 # ============================================================
 def iter_task_events(
     agent: Any,
     *,
     thread_id: str,
     user_input: str | None = None,
+    resume_decisions: list[dict[str, Any]] | None = None,
 ) -> Iterator[AgentEvent]:
     """运行一轮任务并产出结构化事件。
 
@@ -114,19 +179,31 @@ def iter_task_events(
         thread_id: 会话 ID（对话历史经 checkpointer 持久化）。
         user_input: 用户任务文本；None 表示从 checkpoint 断点续跑（/resume），
             此时图从中断处继续，不需要新输入。
+        resume_decisions: 阶段 3 HITL 回答。CLI 收集到用户对每个 action_request
+            的 Decision（dict 形式：{"type": "approve"/"reject"/"respond", ...}）
+            后传入；本函数把它包成 `Command(resume=HITLResponse(decisions=...))`
+            让图从 interrupt 断点继续。`resume_decisions` 与 `user_input` 互斥。
 
     Yields:
-        AgentEvent 序列，最后一个事件恒为 summary（含步数/token/停止原因）。
+        AgentEvent 序列。常规结束恒为 summary；如果 stream 自然结束后检测到
+        pending interrupt，则产出 INTERRUPT 事件后直接返回（不产出 summary，
+        因为任务尚未真正结束，等 CLI 收集 decisions 后再调一次本函数 resume）。
     """
     cfg = {
         "configurable": {"thread_id": thread_id},
         "recursion_limit": config.AGENT_RECURSION_LIMIT,
     }
-    payload = (
-        None
-        if user_input is None
-        else {"messages": [{"role": "user", "content": user_input}]}
-    )
+
+    # 阶段 3：构造 payload——三选一
+    if resume_decisions is not None:
+        # HITL resume：用 Command(resume=...) 让图从 interrupt 继续
+        payload: Any = Command(resume={"decisions": list(resume_decisions)})
+    elif user_input is None:
+        # /resume 续跑：从 checkpoint 的 state.next 继续
+        payload = None
+    else:
+        # 新一轮用户输入
+        payload = {"messages": [{"role": "user", "content": user_input}]}
 
     steps = 0
     tokens = 0
@@ -225,6 +302,23 @@ def iter_task_events(
         if callable(close):
             close()
 
+    # 阶段 3：stream 自然结束后检测是否处于 HITL interrupt 待审批状态。
+    # 若是，产出 INTERRUPT 事件（不产出 summary，等 CLI resume 后再收尾）。
+    if stopped_reason == STOP_COMPLETED:
+        pending = detect_pending_interrupt(agent, cfg)
+        if pending is not None:
+            action_requests = _hitl_request_action_requests(pending)
+            # 拼一段综合描述给 CLI 渲染时使用
+            descriptions = [ar.get("description", "") for ar in action_requests]
+            combined = "\n---\n".join(d for d in descriptions if d)
+            yield AgentEvent(
+                type=INTERRUPT,
+                text=combined,
+                action_requests=action_requests,
+                interrupt_id=str(getattr(pending, "id", "") or ""),
+            )
+            return  # 不产出 summary
+
     yield AgentEvent(
         type=SUMMARY,
         steps=steps,
@@ -247,6 +341,25 @@ def render_event(ev: AgentEvent) -> str:
         return f"助手> {ev.text}"
     if ev.type == ERROR:
         return f"[!] {ev.text}"
+    if ev.type == INTERRUPT:
+        lines = ["[审批请求]"]
+        for i, ar in enumerate(ev.action_requests, 1):
+            name = ar.get("name", "")
+            args = ar.get("args", {})
+            desc = ar.get("description", "")
+            lines.append(f"  {i}. 工具: {name}")
+            if desc:
+                lines.append(f"     {desc}")
+            if args:
+                args_str = _truncate(str(args), 200)
+                lines.append(f"     参数: {args_str}")
+        if not ev.action_requests:
+            lines.append("  (无 action_request 信息)")
+        lines.append(
+            "请决策：/approve | /reject <reason> | /respond <text>"
+            f"  ({len(ev.action_requests)} 个待决策)"
+        )
+        return "\n".join(lines)
     if ev.type == SUMMARY:
         reason_label = {
             STOP_COMPLETED: "完成",
@@ -255,6 +368,7 @@ def render_event(ev: AgentEvent) -> str:
             STOP_RECURSION_LIMIT: "递归超限",
             STOP_INTERRUPTED: "用户中断",
             STOP_ERROR: "异常",
+            STOP_PENDING_INTERRUPT: "等待 HITL 决策",
         }.get(ev.stopped_reason, ev.stopped_reason)
         return f"[本轮统计] {ev.steps} 步 / {ev.tokens} tokens / {reason_label}"
     return f"[{ev.type}] {ev.text}"

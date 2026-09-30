@@ -12,6 +12,7 @@ import sys
 from datetime import datetime
 
 from langchain.agents.middleware import TodoListMiddleware  # write_todos 工具 + todos 状态
+from langchain.agents.middleware import InterruptOnConfig
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.config import get_store  # 工具运行时由 agent 注入 store
@@ -19,7 +20,11 @@ from langgraph.config import get_store  # 工具运行时由 agent 注入 store
 from deepagents import create_deep_agent
 
 from mycodingagent import config
+from mycodingagent.approvals import should_interrupt_command
+from mycodingagent.tools.ask_user import ask_user
 from mycodingagent.tools.calculator import calculate
+from mycodingagent.tools.git_tools import git_commit, git_diff, git_log, git_status
+from mycodingagent.tools.plan import propose_plan
 from mycodingagent.tools.shell import SafeShellBackend
 
 logger = logging.getLogger(__name__)
@@ -108,6 +113,68 @@ def _shell_environment_hint() -> str:
     )
 
 
+# ============================================================
+# 阶段 3：审批请求的描述工厂（InterruptOnConfig.description callable）
+# 把 tool_call 的 args 渲染成可读的审批摘要给用户看
+# ============================================================
+def _execute_description_factory(tool_call, state, runtime) -> str:  # noqa: ANN001
+    """execute 工具审批摘要：展示待执行的 shell 命令。"""
+    command = (tool_call.get("args") or {}).get("command", "")
+    return f"即将执行 shell 命令：\n  {command}"
+
+
+def _commit_description_factory(tool_call, state, runtime) -> str:  # noqa: ANN001
+    """git_commit 审批摘要：展示 status + 已暂存 diff 摘要。"""
+    import subprocess  # 局部导入避免顶部循环依赖
+
+    message = (tool_call.get("args") or {}).get("message", "")
+    parts = [f"提交信息：{message}"]
+
+    # 取工作区状态
+    try:
+        status = subprocess.run(
+            ["git", "status", "--short", "--branch"],
+            cwd=str(config.PROJECT_DIR), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=10,
+        )
+        if status.returncode == 0 and status.stdout.strip():
+            parts.append(f"\n当前工作区状态：\n{status.stdout.strip()}")
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 取已暂存 diff 摘要
+    try:
+        diff = subprocess.run(
+            ["git", "diff", "--cached", "--stat"],
+            cwd=str(config.PROJECT_DIR), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=10,
+        )
+        if diff.returncode == 0 and diff.stdout.strip():
+            parts.append(f"\n本次提交将包含的变更：\n{diff.stdout.strip()}")
+        else:
+            parts.append("\n（无已暂存变更——提交可能失败，建议先 git add）")
+    except Exception:  # noqa: BLE001
+        pass
+
+    return "\n".join(parts)
+
+
+def _plan_prompt_suffix() -> str:
+    """Plan 模式开启时追加到 system prompt 的额外指令。"""
+    if not config.PLAN_MODE:
+        return ""
+    return (
+        "\n## Plan 模式（已开启）\n"
+        "- 当前处于 Plan 模式：所有写操作（execute 写命令、edit_file、write_file、"
+        "git_commit）都会被自动拦截等待用户审批，不会真正执行。\n"
+        "- 你的任务是：先调研代码现状（read_file / ls / grep / glob 只读工具），"
+        "形成清晰的改动计划，然后调用 propose_plan 工具提交计划等用户审批。\n"
+        "- propose_plan 的 plan 参数应包含：要改的文件列表、每个文件的改动要点、"
+        "验证方式（跑哪个测试/脚本）、潜在风险。\n"
+        "- 计划被 approve 后才能开始动手；被 reject 要根据理由重规划。\n"
+    )
+
+
 def build_deep_agent(checkpointer, store):
     """
     create_deep_agent 关键参数：
@@ -124,12 +191,19 @@ def build_deep_agent(checkpointer, store):
     # 确保默认工作目录存在（真实项目目录已存在，此调用对它是 no-op）
     config.PROJECT_DIR.mkdir(exist_ok=True)
 
-    # 主 Agent 的工具：时间 + 长期记忆读写（+ 设置了密钥时的联网搜索）
+    # 主 Agent 的工具：时间 + 长期记忆读写 + Git 工具 + ask_user + propose_plan
+    # （+ 设置了密钥时的联网搜索）
     tools = [
         get_current_time,
         save_user_info,
         recall_user_info,
         recall_user_info_list,
+        git_status,
+        git_diff,
+        git_log,
+        git_commit,
+        ask_user,
+        propose_plan,
     ]
     search_hint = ""
     if config.TAVILY_API_KEY:
@@ -140,8 +214,31 @@ def build_deep_agent(checkpointer, store):
     else:
         logger.info("未设置 TAVILY_API_KEY，联网搜索功能未启用")
 
+    # 阶段 3：interrupt_on 配置——deepagents 原生 HITL 能力
+    # - execute：危险/灰区命令（plan_mode=all 时所有写命令）触发审批
+    # - git_commit：展示 status+diff 摘要后等审批
+    # - ask_user：respond 决策让用户代答
+    # - propose_plan：approve/reject 决策
+    interrupt_on_config = {
+        "execute": InterruptOnConfig(
+            when=should_interrupt_command,
+            allowed_decisions=["approve", "reject"],
+            description=_execute_description_factory,
+        ),
+        "git_commit": InterruptOnConfig(
+            allowed_decisions=["approve", "reject"],
+            description=_commit_description_factory,
+        ),
+        "ask_user": InterruptOnConfig(
+            allowed_decisions=["respond"],
+        ),
+        "propose_plan": InterruptOnConfig(
+            allowed_decisions=["approve", "reject"],
+        ),
+    }
+
     # 子代理：专门负责数学计算，拥有独立的工具集和系统提示词
-    # 主 Agent 看不到 calculate 的内部过程，只收到子代理返回的结论
+    # 显式 interrupt_on={} 避免继承父级审批配置（Plan agent 验证建议）
     calculator_subagent = {
         "name": "calculator",
         "description": (
@@ -154,6 +251,7 @@ def build_deep_agent(checkpointer, store):
             "你是数学计算专家。收到表达式后必须调用 calculate 工具计算，"
             "禁止心算。用中文简要返回计算结果。"
         ),
+        "interrupt_on": {},  # 子代理禁用审批继承
     }
 
     agent = create_deep_agent(
@@ -162,9 +260,13 @@ def build_deep_agent(checkpointer, store):
         backend=SafeShellBackend(root_dir=str(config.PROJECT_DIR), inherit_env=True),
         middleware=[TodoListMiddleware()],
         subagents=[calculator_subagent],   # 注册子代理 → 主 Agent 获得 task 工具
+        interrupt_on=interrupt_on_config,
         system_prompt=(
             f"你是 mycodingagent，一个在用户真实仓库里工作的 coding agent。\n"
             f"当前工作目标目录：{config.PROJECT_DIR}\n"
+            f"审批模式：{config.APPROVAL_MODE}"
+            + ("（已开启 Plan 模式）" if config.PLAN_MODE else "")
+            + "\n"
             "\n## 文件路径约定（重要）\n"
             "- ls / read_file / write_file / edit_file / glob / grep 一律使用"
             "以 / 开头的虚拟路径，/ 就代表上面的项目目录本身：\n"
@@ -201,7 +303,18 @@ def build_deep_agent(checkpointer, store):
             "\n## 任务管理\n"
             "- 多步任务先调用 write_todos 列出计划，每完成一步立即更新状态，"
             "全部完成后再汇报。\n"
-            "- 完成后用中文简要汇报：改了哪些文件、如何验证、结果如何。"
+            "- 完成后用中文简要汇报：改了哪些文件、如何验证、结果如何。\n"
+            "\n## 人机协作（阶段 3）\n"
+            "- execute 的危险/灰区命令（rm、git reset、批量删除、卸载包等）会"
+            "被自动拦截等用户审批。被 reject 时表示用户拒绝该次操作，"
+            "不要换写法绕过，按拒绝理由调整方案即可。\n"
+            "- git_commit 会先展示 status+已暂存 diff 摘要给用户审批，"
+            "approve 后才真正提交。提交前请确认变更已 git add 暂存。\n"
+            "- 信息不足（如多个合理实现方案、缺关键参数）时调用 ask_user "
+            "主动向用户提问，不要瞎猜。问题要具体、可一句话回答。\n"
+            "- Plan 模式由用户用 CLI /plan 命令显式开启；开启时所有写操作"
+            "自动拦截，你应该先调研代码后调用 propose_plan 提交计划等审批。\n"
+            + _plan_prompt_suffix()
         ),
         memory=["/AGENTS.md"],  # 规则型记忆：AGENTS.md 内容每轮注入 system prompt
         checkpointer=checkpointer,  # 短期记忆：对话历史按 thread_id 持久化

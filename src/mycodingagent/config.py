@@ -59,6 +59,32 @@ AGENT_TOKEN_BUDGET = int(os.getenv("AGENT_TOKEN_BUDGET", "300000"))
 VERIFY_LOOP_MAX_ROUNDS = int(os.getenv("VERIFY_LOOP_MAX_ROUNDS", "5"))
 
 # ------------------------------------------------------------
+# 阶段 3：审批与 Plan 模式
+# APPROVAL_MODE：审批粒度
+#   minimal  —— 默认；只对危险/灰区命令触发审批（黑名单也走 interrupt 链路）
+#   all      —— 所有写命令（execute 任意写操作）都触发审批
+#   disabled —— 完全关闭审批（仅供受信任场景调试用）
+# PLAN_MODE：运行时全局开关，由 CLI 的 /plan 命令切换；
+#   True 时所有写工具（execute/edit_file/write_file/git_commit）一律触发审批。
+# ------------------------------------------------------------
+_VALID_APPROVAL_MODES = {"minimal", "all", "disabled"}
+_raw_approval_mode = os.getenv("APPROVAL_MODE", "minimal").lower()
+if _raw_approval_mode not in _VALID_APPROVAL_MODES:
+    raise ValueError(
+        f"APPROVAL_MODE 取值非法：{_raw_approval_mode!r}，"
+        f"允许值：{sorted(_VALID_APPROVAL_MODES)}"
+    )
+APPROVAL_MODE: str = _raw_approval_mode
+
+PLAN_MODE: bool = False
+
+
+def set_plan_mode(value: bool) -> None:
+    """运行时切换 Plan 模式（CLI /plan 调用；propose_plan 审批后由 CLI 解除）。"""
+    global PLAN_MODE
+    PLAN_MODE = bool(value)
+
+# ------------------------------------------------------------
 # 存储路径：锚定项目根目录，不受启动时的工作目录影响
 # ------------------------------------------------------------
 CHECKPOINT_DB = str(PROJECT_ROOT / "agent_state.sqlite")  # 短期记忆：对话历史

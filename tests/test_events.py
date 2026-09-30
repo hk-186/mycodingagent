@@ -251,3 +251,275 @@ def test_render_event_formats():
     assert "工具失败" in render_event(AgentEvent(type=TOOL_END, is_error=True))
     summary_line = render_event(AgentEvent(type=SUMMARY, steps=3, tokens=100))
     assert "本轮统计" in summary_line and "3 步" in summary_line
+
+
+# ============================================================
+# 阶段 3：INTERRUPT 事件 / detect_pending_interrupt / resume_decisions
+# ============================================================
+from mycodingagent.events import (  # noqa: E402 — 局部 import 避免污染顶部
+    INTERRUPT,
+    STOP_PENDING_INTERRUPT,
+    _action_request_to_dict,
+    _hitl_request_action_requests,
+    detect_pending_interrupt,
+)
+from langgraph.types import Command  # noqa: E402
+
+
+class FakeSnapshot:
+    """模拟 langgraph StateSnapshot：只暴露 interrupts 属性。"""
+
+    def __init__(self, interrupts=()):
+        self.interrupts = tuple(interrupts)
+
+
+class FakeInterrupt:
+    """模拟 langgraph Interrupt：value 是 HITLRequest dict。"""
+
+    def __init__(self, value, id="i1"):
+        self.value = value
+        self.id = id
+
+
+class FakeStateAgent(FakeAgent):
+    """扩展 FakeAgent，多一个 get_state() 用于检测 pending interrupt。"""
+
+    def __init__(self, updates, error=None, state_interrupts=()):
+        super().__init__(updates, error)
+        self._state_interrupts = tuple(state_interrupts)
+        self.last_get_state_cfg = None
+
+    def get_state(self, cfg):
+        self.last_get_state_cfg = cfg
+        return FakeSnapshot(interrupts=self._state_interrupts)
+
+
+def _hitl_request(action_name="execute", args=None, description=""):
+    """构造一个 HITLRequest dict。"""
+    return {
+        "action_requests": [
+            {
+                "name": action_name,
+                "args": args or {},
+                "description": description,
+            }
+        ],
+        "review_configs": [],
+    }
+
+
+# ---- detect_pending_interrupt 纯函数 ----
+def test_detect_pending_interrupt_returns_first():
+    hitl = _hitl_request()
+    snap = FakeSnapshot(interrupts=[
+        FakeInterrupt(value=hitl, id="i1"),
+        FakeInterrupt(value=hitl, id="i2"),
+    ])
+    agent = type("A", (), {"get_state": lambda self, cfg: snap})()
+    result = detect_pending_interrupt(agent, {})
+    assert result is not None
+    assert result.id == "i1"
+
+
+def test_detect_pending_interrupt_empty_returns_none():
+    snap = FakeSnapshot(interrupts=())
+    agent = type("A", (), {"get_state": lambda self, cfg: snap})()
+    assert detect_pending_interrupt(agent, {}) is None
+
+
+def test_detect_pending_interrupt_handles_exception():
+    class BoomAgent:
+        def get_state(self, cfg):
+            raise RuntimeError("nope")
+    assert detect_pending_interrupt(BoomAgent(), {}) is None
+
+
+def test_detect_pending_interrupt_handles_missing_get_state():
+    """agent 没有 get_state 方法时不抛异常，返回 None。"""
+    agent = object()
+    assert detect_pending_interrupt(agent, {}) is None
+
+
+# ---- _action_request_to_dict / _hitl_request_action_requests ----
+def test_action_request_to_dict_from_dict():
+    ar = {"name": "execute", "args": {"command": "ls"}, "description": "test"}
+    d = _action_request_to_dict(ar)
+    assert d == {"name": "execute", "args": {"command": "ls"}, "description": "test"}
+
+
+def test_action_request_to_dict_handles_missing_fields():
+    d = _action_request_to_dict({})
+    assert d == {"name": "", "args": {}, "description": ""}
+
+
+def test_action_request_to_dict_from_object():
+    class Obj:
+        name = "execute"
+        args = {"command": "ls"}
+        description = "test"
+    d = _action_request_to_dict(Obj())
+    assert d["name"] == "execute"
+    assert d["args"] == {"command": "ls"}
+    assert d["description"] == "test"
+
+
+def test_hitl_request_action_requests_from_dict():
+    hitl = _hitl_request(action_name="git_commit", args={"message": "fix"}, description="提交")
+    assert len(_hitl_request_action_requests(FakeInterrupt(value=hitl))) == 1
+    ar = _hitl_request_action_requests(FakeInterrupt(value=hitl))[0]
+    assert ar["name"] == "git_commit"
+    assert ar["args"] == {"message": "fix"}
+
+
+def test_hitl_request_action_requests_empty_value():
+    """value 为 None 或缺 action_requests 时返回空列表。"""
+    assert _hitl_request_action_requests(FakeInterrupt(value=None)) == []
+    assert _hitl_request_action_requests(FakeInterrupt(value={})) == []
+
+
+# ---- iter_task_events 检测 pending interrupt 后产出 INTERRUPT ----
+def test_pending_interrupt_produces_interrupt_event_not_summary():
+    """stream 自然结束后检测到 pending interrupt → 产出 INTERRUPT，不产 summary。"""
+    hitl = _hitl_request(
+        action_name="execute",
+        args={"command": "rm -rf /"},
+        description="即将执行：rm -rf /",
+    )
+    agent = FakeStateAgent(
+        updates=[model_update(ai("好的，开始"))],
+        state_interrupts=[FakeInterrupt(value=hitl, id="int-1")],
+    )
+    events = collect(agent, user_input="x")
+    assert [e.type for e in events] == [ASSISTANT_MESSAGE, INTERRUPT]
+    ev = events[-1]
+    assert ev.type == INTERRUPT
+    assert ev.interrupt_id == "int-1"
+    assert len(ev.action_requests) == 1
+    assert ev.action_requests[0]["name"] == "execute"
+    assert ev.action_requests[0]["args"]["command"] == "rm -rf /"
+    assert "即将执行" in ev.text
+
+
+def test_no_pending_interrupt_produces_summary():
+    """stream 结束 + 无 pending interrupt → 正常产出 summary。"""
+    agent = FakeStateAgent(
+        updates=[model_update(ai("完成", total_tokens=10))],
+        state_interrupts=[],
+    )
+    events = collect(agent, user_input="x")
+    assert events[-1].type == SUMMARY
+
+
+def test_multiple_action_requests_in_interrupt_event():
+    """多个 action_request 都应出现在 INTERRUPT 事件中。"""
+    hitl = {
+        "action_requests": [
+            {"name": "execute", "args": {"command": "rm x"}, "description": "删 x"},
+            {"name": "git_commit", "args": {"message": "fix"}, "description": "提交"},
+        ],
+        "review_configs": [],
+    }
+    agent = FakeStateAgent(
+        updates=[model_update(ai("ok"))],
+        state_interrupts=[FakeInterrupt(value=hitl, id="i-multi")],
+    )
+    events = collect(agent, user_input="x")
+    ev = events[-1]
+    assert ev.type == INTERRUPT
+    assert len(ev.action_requests) == 2
+    assert ev.action_requests[0]["name"] == "execute"
+    assert ev.action_requests[1]["name"] == "git_commit"
+
+
+# ---- resume_decisions 参数 ----
+def test_resume_decisions_payload_is_command():
+    """resume_decisions 传入 → payload 是 Command(resume={"decisions": ...})。"""
+    agent = FakeAgent([])  # 立即结束
+    collect(agent, resume_decisions=[{"type": "approve"}])
+    payload = agent.last_payload
+    assert isinstance(payload, Command)
+    resume = getattr(payload, "resume", None)
+    assert resume is not None
+    assert resume["decisions"] == [{"type": "approve"}]
+
+
+def test_resume_decisions_reject_with_message():
+    agent = FakeAgent([])
+    collect(agent, resume_decisions=[{"type": "reject", "message": "不行"}])
+    payload = agent.last_payload
+    assert isinstance(payload, Command)
+    assert payload.resume["decisions"] == [{"type": "reject", "message": "不行"}]
+
+
+def test_resume_decisions_passes_config():
+    """resume 时 config 仍包含 thread_id 和 recursion_limit。"""
+    agent = FakeAgent([])
+    collect(agent, resume_decisions=[{"type": "approve"}])
+    assert agent.last_config["configurable"]["thread_id"] == "t"
+    assert agent.last_config["recursion_limit"] == config.AGENT_RECURSION_LIMIT
+
+
+def test_resume_decisions_exclusive_with_user_input():
+    """resume_decisions 与 user_input 互斥；resume 优先（不构造 messages payload）。"""
+    agent = FakeAgent([])
+    collect(agent, user_input="不应使用", resume_decisions=[{"type": "approve"}])
+    payload = agent.last_payload
+    assert isinstance(payload, Command)
+    # 不应是新 user input 的 dict 形式
+    assert not (isinstance(payload, dict) and "messages" in payload)
+
+
+# ---- render_event INTERRUPT 渲染 ----
+def test_render_interrupt_event():
+    from mycodingagent.events import AgentEvent
+    ev = AgentEvent(
+        type=INTERRUPT,
+        text="即将执行 rm -rf /",
+        action_requests=[
+            {
+                "name": "execute",
+                "args": {"command": "rm -rf /"},
+                "description": "即将执行：rm -rf /",
+            }
+        ],
+        interrupt_id="int-1",
+    )
+    rendered = render_event(ev)
+    assert "[审批请求]" in rendered
+    assert "execute" in rendered
+    assert "rm -rf /" in rendered
+    assert "/approve" in rendered
+    assert "/reject" in rendered
+    assert "/respond" in rendered
+    assert "1 个待决策" in rendered
+
+
+def test_render_interrupt_empty_action_requests():
+    from mycodingagent.events import AgentEvent
+    ev = AgentEvent(type=INTERRUPT, text="")
+    rendered = render_event(ev)
+    assert "[审批请求]" in rendered
+    assert "无 action_request" in rendered
+
+
+def test_render_interrupt_multiple_action_requests():
+    from mycodingagent.events import AgentEvent
+    ev = AgentEvent(
+        type=INTERRUPT,
+        text="",
+        action_requests=[
+            {"name": "execute", "args": {"command": "rm x"}, "description": ""},
+            {"name": "git_commit", "args": {"message": "fix"}, "description": "提交"},
+        ],
+    )
+    rendered = render_event(ev)
+    assert "1." in rendered and "2." in rendered
+    assert "execute" in rendered
+    assert "git_commit" in rendered
+    assert "2 个待决策" in rendered
+
+
+def test_summary_with_pending_interrupt_reason():
+    from mycodingagent.events import AgentEvent
+    line = render_event(AgentEvent(type=SUMMARY, stopped_reason=STOP_PENDING_INTERRUPT))
+    assert "等待 HITL 决策" in line
