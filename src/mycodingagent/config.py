@@ -46,6 +46,19 @@ LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "60"))
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
 
 # ------------------------------------------------------------
+# 阶段 2：三重预算与验证闭环
+# AGENT_RECURSION_LIMIT：LangGraph 图步数上限（模型节点/工具节点各算一步），
+#   超限抛 GraphRecursionError，状态保留在 checkpoint，可用 /resume 续跑。
+# AGENT_MAX_STEPS：每任务模型调用轮次上限（事件流层计数，超限安全停下）。
+# AGENT_TOKEN_BUDGET：每任务累计 token 上限（按 AI 消息 usage_metadata 累计）。
+# VERIFY_LOOP_MAX_ROUNDS：注入 system prompt 的「改完→跑测试→修复」最大轮数。
+# ------------------------------------------------------------
+AGENT_RECURSION_LIMIT = int(os.getenv("AGENT_RECURSION_LIMIT", "80"))
+AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "40"))
+AGENT_TOKEN_BUDGET = int(os.getenv("AGENT_TOKEN_BUDGET", "300000"))
+VERIFY_LOOP_MAX_ROUNDS = int(os.getenv("VERIFY_LOOP_MAX_ROUNDS", "5"))
+
+# ------------------------------------------------------------
 # 存储路径：锚定项目根目录，不受启动时的工作目录影响
 # ------------------------------------------------------------
 CHECKPOINT_DB = str(PROJECT_ROOT / "agent_state.sqlite")  # 短期记忆：对话历史

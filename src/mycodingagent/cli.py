@@ -10,6 +10,7 @@
     /sessions             列出所有历史会话
     /switch <id|序号>     切换到指定会话（序号来自 /sessions 列表）
     /new [名字]           开启新会话（旧会话历史保留在磁盘）
+    /resume               从最近一次中断/超限的断点继续当前会话的任务
     /memory               查看长期记忆（store 中保存的用户信息）
     /history              查看当前会话的消息统计
     /exit                 退出
@@ -25,45 +26,35 @@ from langgraph.store.sqlite import SqliteStore
 
 from mycodingagent import config
 from mycodingagent.agent import build_deep_agent
+from mycodingagent.events import iter_task_events, render_event
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# 运行一轮任务并实时打印执行过程（模型思考 / 工具调用 / 工具结果）
+# 运行一轮任务：消费结构化事件流并渲染到终端（阶段 2）
+# 事件转换与三重预算（recursion_limit / 步数 / token）都在
+# events.iter_task_events 内完成，这里只做展示。
 # ============================================================
-def run_task(agent, user_input: str, thread_id: str = "main") -> None:
-    print(f"\n{'='*60}\n任务> {user_input}  [会话: {thread_id}]\n{'='*60}")
-    cfg = {"configurable": {"thread_id": thread_id}}
-
-    # 记录调用前的消息数，用于跳过"历史消息"
-    state = agent.get_state(cfg)
-    n_before = len(state.values.get("messages", [])) if state.values else 0
-
-    # stream_mode="values" 每步产出完整状态，用 printed 做增量截取，
-    # 只打印"本轮新增"的消息：
-    # 人类消息 → AI 消息(可能含 tool_calls) → 工具结果消息 → ... → 最终 AI 回答
-    printed = n_before + 1  # 跳过历史消息和本轮刚加入的用户消息
-    for snapshot in agent.stream(
-        {"messages": [{"role": "user", "content": user_input}]},
-        config=cfg,  # 传 thread_id → 对话历史自动读写 checkpointer（短期记忆）
-        stream_mode="values",
-    ):
-        for msg in snapshot["messages"][printed:]:
-            printed += 1
-            role = msg.__class__.__name__
-            if getattr(msg, "tool_calls", None):
-                for tc in msg.tool_calls:
-                    args_text = str(tc["args"])
-                    if len(args_text) > 100:
-                        args_text = args_text[:100] + "..."
-                    print(f"  [工具调用] {tc['name']}({args_text})", flush=True)
-            elif role == "ToolMessage":
-                preview = (msg.content or "")[:150].replace("\n", " ")
-                suffix = "..." if len(msg.content or "") > 150 else ""
-                print(f"  [工具结果] {preview}{suffix}", flush=True)
-            elif msg.content:
-                print(f"助手> {msg.content}", flush=True)
+def run_task(
+    agent,
+    user_input: str | None,
+    thread_id: str = "main",
+    *,
+    resume: bool = False,
+) -> None:
+    shown = "(从上次断点继续)" if resume else user_input
+    title = "续跑>" if resume else "任务>"
+    print(f"\n{'='*60}\n{title} {shown}  [会话: {thread_id}]\n{'='*60}")
+    try:
+        for event in iter_task_events(
+            agent,
+            thread_id=thread_id,
+            user_input=None if resume else user_input,
+        ):
+            print(render_event(event), flush=True)
+    except KeyboardInterrupt:
+        print("\n[已中断] 输入 /resume 可从断点继续。")
 
 
 # ============================================================
@@ -96,9 +87,18 @@ def chat(agent, store, checkpointer) -> None:
                 print("  /sessions             列出所有历史会话")
                 print("  /switch <id|序号>     切换到指定会话")
                 print("  /new [名字]           开启新会话（旧会话历史保留）")
+                print("  /resume               从断点继续当前会话中断的任务")
                 print("  /memory               查看长期记忆中保存的用户信息")
                 print("  /history              查看当前会话的消息统计")
                 print("  /exit                 退出")
+            elif cmd == "/resume":
+                state = get_state(thread_id)
+                if not state.next:
+                    print("[当前会话没有可恢复的中断任务]")
+                else:
+                    pending = ", ".join(state.next)
+                    print(f"[从断点继续，待执行节点: {pending}]")
+                    run_task(agent, None, thread_id, resume=True)
             elif cmd == "/new":
                 thread_id = arg.strip() or f"session-{datetime.now():%Y%m%d-%H%M%S}"
                 print(f"[已切换到新会话: {thread_id}]")
