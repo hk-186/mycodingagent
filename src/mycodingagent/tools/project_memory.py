@@ -13,7 +13,8 @@
 from langchain_core.tools import tool
 from langgraph.config import get_store
 
-from mycodingagent import config, memory_common
+from mycodingagent import config
+from mycodingagent.tools import memory_common
 
 
 @tool

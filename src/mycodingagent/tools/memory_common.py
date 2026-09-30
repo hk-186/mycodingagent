@@ -3,8 +3,9 @@
 长期记忆共享约定（阶段 5 修复）
 ================================
 
-个人记忆（agent.py，命名空间 ("users",)）与项目记忆（tools/project_memory.py，
-命名空间 config.project_namespace()）共用同一套 key-value 结构与检索策略。
+个人记忆（tools/user_memory.py，命名空间 ("users",)）与项目记忆
+（tools/project_memory.py，命名空间 config.project_namespace()）共用同一套
+key-value 结构与检索策略。
 
 修复的问题：
     原先向量只编码 value 内容（text_fields=["value"]），store 的 key 不参与

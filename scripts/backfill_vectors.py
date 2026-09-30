@@ -34,8 +34,9 @@ import sys
 from langchain_openai import OpenAIEmbeddings
 from langgraph.store.sqlite import SqliteStore
 
-from mycodingagent import config, memory_common
-from mycodingagent.memory_common import INDEX_TEXT_FIELD, VALUE_FIELD
+from mycodingagent import config
+from mycodingagent.tools import memory_common
+from mycodingagent.tools.memory_common import INDEX_TEXT_FIELD, VALUE_FIELD
 
 
 def plan_upgrades(db_path: str) -> tuple[int, list[tuple[str, str, str]]]:

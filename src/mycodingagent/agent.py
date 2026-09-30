@@ -15,11 +15,10 @@ from langchain.agents.middleware import TodoListMiddleware  # write_todos 工具
 from langchain.agents.middleware import InterruptOnConfig
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
-from langgraph.config import get_store  # 工具运行时由 agent 注入 store
 
 from deepagents import create_deep_agent
 
-from mycodingagent import config, memory_common
+from mycodingagent import config
 from mycodingagent.approvals import should_interrupt_command
 from mycodingagent.project_middleware import ProjectMemoryMiddleware
 from mycodingagent.prompt_runtime import RuntimePromptMiddleware
@@ -33,6 +32,11 @@ from mycodingagent.tools.project_memory import (
     save_project_fact,
 )
 from mycodingagent.tools.shell import SafeShellBackend
+from mycodingagent.tools.user_memory import (
+    recall_user_info,
+    recall_user_info_list,
+    save_user_info,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,51 +61,6 @@ def get_llm() -> ChatOpenAI:
 def get_current_time() -> str:
     """获取当前的日期和时间"""
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S %A")
-
-
-# ============================================================
-# 长期记忆的读写工具（信息存入 SqliteStore，跨会话共享）
-# get_store() 在工具运行时取出 create_deep_agent(store=...) 注入的 store
-# ============================================================
-@tool
-def save_user_info(key: str, value: str) -> str:
-    """保存用户的长期个人信息（跨项目共享）。key 是信息类别（如 name、email、hobby），value 是具体内容"""
-    store = get_store()
-    store.put(("users",), key, memory_common.make_record(key, value))
-    return f"已记住：{key} = {value}"
-
-
-@tool
-def recall_user_info(query: str) -> str:
-    """回忆用户的长期个人信息，可用精确类别名或自然语言描述（语义检索）。
-
-    项目相关的约定请用 recall_project_fact。
-    """
-    store = get_store()
-    # 1) 精确按 key 取
-    item = store.get(("users",), query)
-    if item is not None:
-        return f"{query} = {memory_common.record_value(item.value)}"
-    # 2) key 子串匹配兜底：query 里夹带了明确 key（如「用户的姓名 name」）
-    all_items = store.search(("users",))
-    key_hits = memory_common.match_record_keys(query, all_items)
-    if key_hits:
-        return memory_common.format_items(key_hits)
-    # 3) 语义索引检索（向量同时编码了 key 与 value）
-    hits = store.search(("users",), query=query, limit=5)
-    if hits:
-        return memory_common.format_items(hits)
-    return f"没有找到与「{query}」相关的记忆"
-
-
-@tool
-def recall_user_info_list() -> str:
-    """列出所有已保存的用户长期信息（显式列举，非模糊查询）"""
-    store = get_store()
-    items = store.search(("users",))
-    if not items:
-        return "还没有保存任何用户信息"
-    return memory_common.format_items(items)
 
 
 # ============================================================

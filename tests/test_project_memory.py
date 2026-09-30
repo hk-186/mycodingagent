@@ -166,7 +166,7 @@ class _DeterministicEmbeddings(Embeddings):
 
 
 def test_sqlite_semantic_index_roundtrip(tmp_path):
-    from mycodingagent.memory_common import INDEX_TEXT_FIELD, make_record
+    from mycodingagent.tools.memory_common import INDEX_TEXT_FIELD, make_record
 
     db = str(tmp_path / "mem.sqlite")
     with SqliteStore.from_conn_string(

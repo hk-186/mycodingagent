@@ -8,9 +8,13 @@
 
 import pytest
 
-from mycodingagent import memory_common
-from mycodingagent.agent import recall_user_info, recall_user_info_list, save_user_info
-from mycodingagent.memory_common import INDEX_TEXT_FIELD, VALUE_FIELD
+from mycodingagent.tools import memory_common
+from mycodingagent.tools.memory_common import INDEX_TEXT_FIELD, VALUE_FIELD
+from mycodingagent.tools.user_memory import (
+    recall_user_info,
+    recall_user_info_list,
+    save_user_info,
+)
 
 
 # ============================================================
@@ -108,7 +112,7 @@ class FakeStore:
 @pytest.fixture()
 def fake_store(monkeypatch):
     store = FakeStore()
-    monkeypatch.setattr("mycodingagent.agent.get_store", lambda: store)
+    monkeypatch.setattr("mycodingagent.tools.user_memory.get_store", lambda: store)
     return store
 
 
