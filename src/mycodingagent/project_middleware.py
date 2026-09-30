@@ -49,7 +49,7 @@ class ProjectMemoryMiddleware(MemoryMiddleware):
                 contents[path] = response.content.decode("utf-8")
         return contents
 
-    def before_agent(self, state, runtime, _cfg):  # noqa: ANN001
+    def before_agent(self, state, runtime):  # noqa: ANN001, ARG001
         current = str(config.PROJECT_DIR)
         if "memory_contents" in state and state.get("project_memory_path") == current:
             return None  # 同项目：沿用缓存
@@ -59,7 +59,7 @@ class ProjectMemoryMiddleware(MemoryMiddleware):
             "project_memory_path": current,
         }
 
-    async def abefore_agent(self, state, runtime, _cfg):  # noqa: ANN001
+    async def abefore_agent(self, state, runtime):  # noqa: ANN001, ARG001
         current = str(config.PROJECT_DIR)
         if "memory_contents" in state and state.get("project_memory_path") == current:
             return None
