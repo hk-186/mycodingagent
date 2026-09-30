@@ -14,22 +14,28 @@
     /memory               查看长期记忆（store 中保存的用户信息）
     /history              查看当前会话的消息统计
     /plan <task>          进入 Plan 模式执行任务（先输出计划等审批）
-    /approve              审批通过当前 INTERRUPT 事件的所有 action_request
-    /reject <reason>      拒绝当前 INTERRUPT，reason 可选
-    /respond <text>       用 respond 决策回答 ask_user 工具的问题
+    /pwd                  查看当前工作目录
+    /cd <path>            切换工作目录（目录必须已存在；相对路径相对当前目录）
     /exit                 退出
+
+审批弹窗（执行任务时自动弹出 决策> 提示符，无需手动输入）：
+    /approve              审批通过当前操作
+    /reject [<reason>]    拒绝当前审批，可附原因
+    /respond <text>       用回答内容代答 ask_user 工具的问题
 """
 
 import argparse
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.store.sqlite import SqliteStore
 
 from mycodingagent import config
 from mycodingagent.agent import build_deep_agent
+from mycodingagent.tools.shell import SafeShellBackend
 from mycodingagent.events import (
     INTERRUPT,
     SUMMARY,
@@ -196,9 +202,30 @@ def run_task(
 
 
 # ============================================================
+# 运行时切换工作目录（/pwd 查看、/cd 切换）
+# 同步两处真相：config.PROJECT_DIR（Git 工具 / 审批摘要读它）与
+# backend.cwd（execute / 文件工具读它）。
+# ============================================================
+def change_project_dir(backend, path: str) -> str:
+    """切换工作目录，返回成功提示。
+
+    相对路径相对当前 config.PROJECT_DIR 解析（而非进程启动目录）。
+    目标目录必须已存在；校验失败抛 NotADirectoryError，原目录保持不变。
+    """
+    p = Path(path.strip()).expanduser()
+    if not p.is_absolute():
+        p = Path(config.PROJECT_DIR) / p
+    resolved = p.resolve()
+    # config 先校验并切换，backend 再跟随（两处校验同一目录）
+    config.set_project_dir(resolved)
+    backend.set_root_dir(resolved)
+    return f"工作目录已切换为：{resolved}"
+
+
+# ============================================================
 # 交互模式
 # ============================================================
-def chat(agent, store, checkpointer) -> None:
+def chat(agent, store, checkpointer, backend) -> None:
     thread_id = "main"  # 默认会话固定 id：重启进程后可接着聊（短期记忆持久化）
     print(f"模型: {config.MODEL_NAME} | 会话: {thread_id} | 项目目录: {config.PROJECT_DIR}")
     print(f"审批模式: {config.APPROVAL_MODE} | Plan 模式: {'开启' if config.PLAN_MODE else '关闭'}")
@@ -223,17 +250,23 @@ def chat(agent, store, checkpointer) -> None:
             if cmd == "/exit":
                 break
             elif cmd == "/help":
+                print("【会话命令】（在 你> 提示符下直接输入）")
                 print("  /sessions             列出所有历史会话")
                 print("  /switch <id|序号>     切换到指定会话")
-                print("  /new [名字]           开启新会话（旧会话历史保留）")
+                print("  /new [名字]           开启新会话（旧会话历史保留在磁盘）")
                 print("  /resume               从断点继续当前会话中断的任务")
                 print("  /memory               查看长期记忆中保存的用户信息")
                 print("  /history              查看当前会话的消息统计")
                 print("  /plan <task>          进入 Plan 模式执行任务")
-                print("  /approve              在 INTERRUPT 状态下审批通过")
-                print("  /reject [<reason>]    拒绝当前审批，可附原因")
-                print("  /respond <text>       用 respond 决策回答 ask_user 工具的问题")
+                print("  /pwd                  查看当前工作目录")
+                print("  /cd <path>            切换工作目录（目录必须已存在）")
                 print("  /exit                 退出")
+                print()
+                print("【审批弹窗下可用的输入】（执行任务时自动弹出 决策> 提示符，无需手动输入）")
+                print("  /approve              审批通过当前操作")
+                print("  /reject [<reason>]    拒绝当前审批，可附原因")
+                print("  /respond <text>       用回答内容代答 ask_user 工具的问题")
+                print("  （也支持简写：a | r [<reason>] | rr <text>）")
             elif cmd == "/resume":
                 state = get_state(thread_id)
                 if not state.next:
@@ -285,6 +318,18 @@ def chat(agent, store, checkpointer) -> None:
                         # 兜底：若任务结束（含异常）Plan 模式仍开启则关闭
                         if config.PLAN_MODE:
                             config.set_plan_mode(False)
+            elif cmd == "/pwd":
+                print(f"[当前工作目录: {config.PROJECT_DIR}]")
+            elif cmd == "/cd":
+                target = arg.strip()
+                if not target:
+                    print(f"[当前工作目录: {config.PROJECT_DIR}]")
+                else:
+                    try:
+                        print(f"[{change_project_dir(backend, target)}]")
+                    except NotADirectoryError as e:
+                        print(f"[切换失败：{e}]")
+                        print(f"[工作目录保持：{config.PROJECT_DIR}]")
             else:
                 print(f"[未知命令 {cmd}，输入 /help 查看命令]")
             continue
@@ -327,8 +372,12 @@ def main() -> None:
     saver_cm = SqliteSaver.from_conn_string(config.CHECKPOINT_DB)
     store_cm = SqliteStore.from_conn_string(config.STORE_DB)
     with saver_cm as checkpointer, store_cm as store:
-        agent = build_deep_agent(checkpointer, store)
-        chat(agent, store, checkpointer)
+        # backend 提前构造并注入 agent，CLI 才能在运行时 /cd 切换同一实例的目录
+        backend = SafeShellBackend(
+            root_dir=str(config.PROJECT_DIR), inherit_env=True
+        )
+        agent = build_deep_agent(checkpointer, store, backend=backend)
+        chat(agent, store, checkpointer, backend)
 
     print("再见！对话历史、长期记忆和文件都已保存，下次启动依然有效。")
 

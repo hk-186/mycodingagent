@@ -133,3 +133,30 @@ def test_backend_child_python_utf8_output(backend):
     result = backend.execute("python -c \"print('中文输出')\"")
     assert result.exit_code == 0
     assert "中文输出" in result.output
+
+
+# ============================================================
+# set_root_dir：运行时切换工作目录（/cd）
+# ============================================================
+def test_set_root_dir_switches_cwd(backend, tmp_path):
+    new_dir = tmp_path / "sub"
+    new_dir.mkdir()
+    backend.set_root_dir(new_dir)
+    assert backend.cwd == new_dir.resolve()
+
+
+def test_set_root_dir_rejects_missing_path(backend, tmp_path):
+    missing = tmp_path / "nope"
+    with pytest.raises(NotADirectoryError):
+        backend.set_root_dir(missing)
+
+
+def test_execute_follows_switched_root(backend, tmp_path):
+    """切换目录后，execute 新建的文件必须落在新目录而非旧目录。"""
+    other = tmp_path / "other"
+    other.mkdir()
+    backend.set_root_dir(other)
+    marker = "marker_after_cd.txt"
+    backend.execute(f"python -c \"open('{marker}', 'w').close()\"")
+    assert (other / marker).exists()
+    assert not (tmp_path / marker).exists()

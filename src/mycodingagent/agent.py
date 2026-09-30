@@ -21,6 +21,7 @@ from deepagents import create_deep_agent
 
 from mycodingagent import config
 from mycodingagent.approvals import should_interrupt_command
+from mycodingagent.prompt_runtime import RuntimePromptMiddleware
 from mycodingagent.tools.ask_user import ask_user
 from mycodingagent.tools.calculator import calculate
 from mycodingagent.tools.git_tools import git_commit, git_diff, git_log, git_status
@@ -159,29 +160,15 @@ def _commit_description_factory(tool_call, state, runtime) -> str:  # noqa: ANN0
     return "\n".join(parts)
 
 
-def _plan_prompt_suffix() -> str:
-    """Plan 模式开启时追加到 system prompt 的额外指令。"""
-    if not config.PLAN_MODE:
-        return ""
-    return (
-        "\n## Plan 模式（已开启）\n"
-        "- 当前处于 Plan 模式：所有写操作（execute 写命令、edit_file、write_file、"
-        "git_commit）都会被自动拦截等待用户审批，不会真正执行。\n"
-        "- 你的任务是：先调研代码现状（read_file / ls / grep / glob 只读工具），"
-        "形成清晰的改动计划，然后调用 propose_plan 工具提交计划等用户审批。\n"
-        "- propose_plan 的 plan 参数应包含：要改的文件列表、每个文件的改动要点、"
-        "验证方式（跑哪个测试/脚本）、潜在风险。\n"
-        "- 计划被 approve 后才能开始动手；被 reject 要根据理由重规划。\n"
-    )
-
-
-def build_deep_agent(checkpointer, store):
+def build_deep_agent(checkpointer, store, backend=None):
     """
     create_deep_agent 关键参数：
 
     - backend：SafeShellBackend 把文件工具与 execute 的根目录锚定在项目目录，
-      并在执行 shell 命令前做危险命令拦截（阶段 1）
-    - middleware：TodoListMiddleware 提供 write_todos 工具（阶段 1 缺口 C6）
+      并在执行 shell 命令前做危险命令拦截（阶段 1）。可由外部传入（CLI /cd
+      需要持有同一实例在运行时切换目录）；不传则内部构造一个。
+    - middleware：TodoListMiddleware 提供 write_todos 工具（阶段 1 缺口 C6）；
+      RuntimePromptMiddleware 在每次调模型前替换 prompt 中的运行时占位符。
     - subagents：注册后主 Agent 自动获得 task 工具，按 description 决定何时委派
     - checkpointer / store：短期记忆（对话历史）/ 长期记忆（用户信息）
     - memory：AGENTS.md 风格的规则记忆，内容每轮注入 system prompt
@@ -190,6 +177,10 @@ def build_deep_agent(checkpointer, store):
 
     # 确保默认工作目录存在（真实项目目录已存在，此调用对它是 no-op）
     config.PROJECT_DIR.mkdir(exist_ok=True)
+
+    # backend 可由外部注入（运行时 /cd 需要 CLI 持有同一实例）
+    if backend is None:
+        backend = SafeShellBackend(root_dir=str(config.PROJECT_DIR), inherit_env=True)
 
     # 主 Agent 的工具：时间 + 长期记忆读写 + Git 工具 + ask_user + propose_plan
     # （+ 设置了密钥时的联网搜索）
@@ -257,16 +248,14 @@ def build_deep_agent(checkpointer, store):
     agent = create_deep_agent(
         model=llm,
         tools=tools,
-        backend=SafeShellBackend(root_dir=str(config.PROJECT_DIR), inherit_env=True),
-        middleware=[TodoListMiddleware()],
+        backend=backend,
+        middleware=[TodoListMiddleware(), RuntimePromptMiddleware()],
         subagents=[calculator_subagent],   # 注册子代理 → 主 Agent 获得 task 工具
         interrupt_on=interrupt_on_config,
         system_prompt=(
-            f"你是 mycodingagent，一个在用户真实仓库里工作的 coding agent。\n"
-            f"当前工作目标目录：{config.PROJECT_DIR}\n"
-            f"审批模式：{config.APPROVAL_MODE}"
-            + ("（已开启 Plan 模式）" if config.PLAN_MODE else "")
-            + "\n"
+            "你是 mycodingagent，一个在用户真实仓库里工作的 coding agent。\n"
+            "当前工作目标目录：__PROJECT_DIR__\n"
+            "审批模式：__APPROVAL_MODE____PLAN_MODE_LABEL__\n"
             "\n## 文件路径约定（重要）\n"
             "- ls / read_file / write_file / edit_file / glob / grep 一律使用"
             "以 / 开头的虚拟路径，/ 就代表上面的项目目录本身：\n"
@@ -314,7 +303,7 @@ def build_deep_agent(checkpointer, store):
             "主动向用户提问，不要瞎猜。问题要具体、可一句话回答。\n"
             "- Plan 模式由用户用 CLI /plan 命令显式开启；开启时所有写操作"
             "自动拦截，你应该先调研代码后调用 propose_plan 提交计划等审批。\n"
-            + _plan_prompt_suffix()
+            "__PLAN_MODE_SUFFIX__"
         ),
         memory=["/AGENTS.md"],  # 规则型记忆：AGENTS.md 内容每轮注入 system prompt
         checkpointer=checkpointer,  # 短期记忆：对话历史按 thread_id 持久化

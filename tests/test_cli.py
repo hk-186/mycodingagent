@@ -5,10 +5,18 @@
 两个纯逻辑函数，不依赖真实 agent。
 """
 
+from pathlib import Path
+
 import pytest
 
-from mycodingagent.cli import _collect_decisions_for_interrupt, _parse_decision_input
+from mycodingagent import config
+from mycodingagent.cli import (
+    _collect_decisions_for_interrupt,
+    _parse_decision_input,
+    change_project_dir,
+)
 from mycodingagent.events import AgentEvent, INTERRUPT
+from mycodingagent.tools.shell import SafeShellBackend
 
 
 # ============================================================
@@ -167,3 +175,38 @@ def test_collect_respond_for_ask_user(monkeypatch):
     ])
     decisions = _collect_decisions_for_interrupt(ev)
     assert decisions == [{"type": "respond", "message": "请按方案 A 执行"}]
+
+
+# ============================================================
+# change_project_dir：运行时 /cd（同步 config 与 backend）
+# ============================================================
+@pytest.fixture()
+def dir_backend(tmp_path, monkeypatch):
+    """锚定到 tmp_path 的 backend，并把全局 config 一并 monkeypatch（teardown 恢复）。"""
+    monkeypatch.setattr(config, "PROJECT_DIR", tmp_path.resolve())
+    return SafeShellBackend(root_dir=str(tmp_path), inherit_env=True)
+
+
+class TestChangeProjectDir:
+    def test_absolute_switch(self, dir_backend, tmp_path):
+        target = tmp_path / "proj_b"
+        target.mkdir()
+        msg = change_project_dir(dir_backend, str(target))
+        assert "已切换" in msg
+        assert config.PROJECT_DIR == target.resolve()
+        assert dir_backend.cwd == target.resolve()
+
+    def test_relative_switch(self, dir_backend, tmp_path):
+        target = tmp_path / "nested"
+        target.mkdir()
+        change_project_dir(dir_backend, "nested")
+        assert config.PROJECT_DIR == target.resolve()
+        assert dir_backend.cwd == target.resolve()
+
+    def test_missing_target_keeps_original(self, dir_backend, tmp_path):
+        original = config.PROJECT_DIR
+        with pytest.raises(NotADirectoryError):
+            change_project_dir(dir_backend, str(tmp_path / "ghost"))
+        # 校验失败：config 与 backend 都保持原目录
+        assert config.PROJECT_DIR == original
+        assert dir_backend.cwd == Path(original)

@@ -15,6 +15,7 @@ Shell 执行（缺口 C1）
 
 import subprocess
 import sys
+from pathlib import Path
 
 from deepagents.backends.local_shell import DEFAULT_EXECUTE_TIMEOUT, LocalShellBackend
 from deepagents.backends.protocol import ExecuteResponse
@@ -60,6 +61,17 @@ class SafeShellBackend(LocalShellBackend):
         )
         # 让被执行的子 Python 进程用 UTF-8 输出，配合 _decode_output 优先 UTF-8
         self._env.setdefault("PYTHONIOENCODING", "utf-8")
+
+    def set_root_dir(self, path: str | Path) -> None:
+        """运行时切换工作根目录（CLI /cd 调用）。
+
+        目录必须已存在；切换后 execute 的 cwd 与所有文件工具的虚拟根
+        都立即指向新目录（这些操作每次都实时读取 self.cwd）。
+        """
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.is_dir():
+            raise NotADirectoryError(f"项目目录不存在：{resolved}")
+        self.cwd = resolved
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         # 第一道：危险命令黑名单
