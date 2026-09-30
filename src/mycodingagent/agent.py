@@ -24,6 +24,7 @@ from mycodingagent.approvals import should_interrupt_command
 from mycodingagent.project_middleware import ProjectMemoryMiddleware
 from mycodingagent.prompt_runtime import RuntimePromptMiddleware
 from mycodingagent.tools.ask_user import ask_user
+from mycodingagent.tools.calculator import calculate
 from mycodingagent.tools.git_tools import git_commit, git_diff, git_log, git_status
 from mycodingagent.tools.plan import propose_plan
 from mycodingagent.tools.project_memory import (
@@ -198,6 +199,7 @@ def build_deep_agent(checkpointer, store, backend=None):
     # （+ 设置了密钥时的联网搜索）
     tools = [
         get_current_time,
+        calculate,
         save_user_info,
         recall_user_info,
         recall_user_info_list,
