@@ -1,0 +1,9 @@
+{
+  "name": "fix-slugify-edge",
+  "type": "bugfix",
+  "prompt": "text_tools.py 的 slugify 输出不对：slugify('  Hello   World  ') 得到的是 '--hello---world--'，期望是 'hello-world'。请修复它，让 test_text_tools.py 全部通过。",
+  "graders": [
+    {"type": "command", "run": "python -m pytest -q", "expect_exit_code": 0},
+    {"type": "file_not_contains", "path": "text_tools.py", "pattern": "re.sub(r\"[^a-z0-9]\", \"-\""}
+  ]
+}

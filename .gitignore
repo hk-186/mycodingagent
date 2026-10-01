@@ -6,3 +6,4 @@ __pycache__/
 *.sqlite*
 deep_agent_workspace/
 workspace/
+evals/results/*.json

@@ -1,0 +1,10 @@
+{
+  "name": "add-is-palindrome",
+  "type": "feature",
+  "prompt": "请给 string_utils.py 增加一个 is_palindrome(text) 函数：判断字符串是否为回文，比较时忽略大小写、忽略非字母数字字符；空串和单字符算回文。test_string_utils.py 里有验收测试，跑通它们。",
+  "graders": [
+    {"type": "command", "run": "python -m pytest -q", "expect_exit_code": 0},
+    {"type": "file_contains", "path": "string_utils.py", "pattern": "def is_palindrome"},
+    {"type": "llm_review", "criteria": "是否只新增函数未改动 shout 等现有代码；忽略大小写与非字母数字的实现是否正确；有无多余改动"}
+  ]
+}

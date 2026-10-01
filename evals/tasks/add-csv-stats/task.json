@@ -1,0 +1,10 @@
+{
+  "name": "add-csv-stats",
+  "type": "feature",
+  "prompt": "请给 csv_stats.py 增加 column_average(path, column) 函数：读取 CSV 文件，返回指定列的数字平均值。要求：空值和非数字的行跳过不计；列名不存在时抛 KeyError；整列没有任何有效数字时抛 ValueError。test_csv_stats.py 里有验收测试（含样例 sample.csv），跑通它们。",
+  "graders": [
+    {"type": "command", "run": "python -m pytest -q", "expect_exit_code": 0},
+    {"type": "file_contains", "path": "csv_stats.py", "pattern": "def column_average"},
+    {"type": "llm_review", "criteria": "边界处理是否正确（空值/非数字/列缺失/全无效四种分支）；read_rows 是否未被破坏；是否最小改动"}
+  ]
+}

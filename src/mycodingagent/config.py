@@ -133,3 +133,16 @@ def project_namespace() -> tuple[str, ...]:
     """返回当前项目的长期记忆命名空间。"""
     slug = re.sub(r"[^a-z0-9]+", "_", str(PROJECT_DIR).lower()).strip("_")
     return ("projects", slug, "facts")
+
+
+# ------------------------------------------------------------
+# 阶段 6：eval 回归集（scripts/run_evals.py 使用）
+# EVAL_TASK_TIMEOUT：单任务 wall-clock 超时（秒），事件粒度检查。
+# EVAL_COMMAND_TIMEOUT：command grader 在沙箱内执行验收命令的超时（秒）。
+# EVAL_REVIEW_MODEL：llm_review 评审模型；留空则复用 MODEL_NAME。
+# EVAL_REVIEW_PASS_SCORE：llm_review 及格线（1-5 分制）。
+# ------------------------------------------------------------
+EVAL_TASK_TIMEOUT = int(os.getenv("EVAL_TASK_TIMEOUT", "600"))
+EVAL_COMMAND_TIMEOUT = int(os.getenv("EVAL_COMMAND_TIMEOUT", "120"))
+EVAL_REVIEW_MODEL = os.getenv("EVAL_REVIEW_MODEL", "")
+EVAL_REVIEW_PASS_SCORE = int(os.getenv("EVAL_REVIEW_PASS_SCORE", "3"))

@@ -1,0 +1,9 @@
+{
+  "name": "fix-clamp-boundary",
+  "type": "bugfix",
+  "prompt": "工作目录里 utils.py 的 clamp(value, low, high) 有 bug：clamp(0, 1, 10) 返回了 2，期望是 1；而且 low > high 时应该报错却没有。请修复它，让 test_utils.py 的测试全部通过。",
+  "graders": [
+    {"type": "command", "run": "python -m pytest -q", "expect_exit_code": 0},
+    {"type": "file_contains", "path": "utils.py", "pattern": "raise ValueError"}
+  ]
+}

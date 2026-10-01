@@ -1,0 +1,10 @@
+{
+  "name": "refactor-report-dedupe",
+  "type": "refactor",
+  "prompt": "report.py 里 render_sales 和 render_expenses 几乎完全重复，只有标题不同。请把公共逻辑抽成私有函数消除重复，两个公开函数的输出格式必须保持完全不变。跑项目测试确认行为没变。",
+  "graders": [
+    {"type": "command", "run": "python -m pytest -q", "expect_exit_code": 0},
+    {"type": "command", "run": "python check_dedupe.py", "expect_exit_code": 0},
+    {"type": "llm_review", "criteria": "重复逻辑是否真正抽成公共函数；两个公开函数是否只剩标题差异；输出格式是否与原来完全一致（含分隔线与空行）"}
+  ]
+}
