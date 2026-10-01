@@ -141,8 +141,12 @@ def project_namespace() -> tuple[str, ...]:
 # EVAL_COMMAND_TIMEOUT：command grader 在沙箱内执行验收命令的超时（秒）。
 # EVAL_REVIEW_MODEL：llm_review 评审模型；留空则复用 MODEL_NAME。
 # EVAL_REVIEW_PASS_SCORE：llm_review 及格线（1-5 分制）。
+# EVAL_LLM_MAX_RETRIES：eval 运行期间临时覆盖 LLM_MAX_RETRIES（默认 1）。
+# 端点抖动时重试会把单次逻辑调用放大到 LLM_TIMEOUT×(1+重试)，子代理多轮
+# 循环累积轻松超过单任务时限；eval 求快速失败，交互场景仍用全局配置。
 # ------------------------------------------------------------
 EVAL_TASK_TIMEOUT = int(os.getenv("EVAL_TASK_TIMEOUT", "600"))
 EVAL_COMMAND_TIMEOUT = int(os.getenv("EVAL_COMMAND_TIMEOUT", "120"))
 EVAL_REVIEW_MODEL = os.getenv("EVAL_REVIEW_MODEL", "")
 EVAL_REVIEW_PASS_SCORE = int(os.getenv("EVAL_REVIEW_PASS_SCORE", "3"))
+EVAL_LLM_MAX_RETRIES = int(os.getenv("EVAL_LLM_MAX_RETRIES", "1"))

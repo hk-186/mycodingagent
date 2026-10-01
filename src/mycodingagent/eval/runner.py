@@ -259,6 +259,11 @@ def run_one(
 
     started = time.monotonic()
     original_project_dir = config.PROJECT_DIR
+    # eval 求快速失败：端点抖动时高重试会把单次逻辑调用放大到
+    # LLM_TIMEOUT×(1+retries)，子代理多轮累积易超单任务时限。
+    # 临时覆盖 LLM_MAX_RETRIES（agent/llm_review 构建时读取），结束恢复。
+    original_max_retries = config.LLM_MAX_RETRIES
+    config.LLM_MAX_RETRIES = config.EVAL_LLM_MAX_RETRIES
     try:
         with tempfile.TemporaryDirectory(prefix="mca-eval-") as sandbox_str:
             sandbox = Path(sandbox_str)
@@ -289,6 +294,7 @@ def run_one(
                 grader_results = run_graders(task.graders, ctx)
             finally:
                 config.set_project_dir(original_project_dir)
+                config.LLM_MAX_RETRIES = original_max_retries
 
         # 判定语义：grader 全过且 agent 正常收尾（completed）才算 pass。
         # 超时/超限场景下文件可能已改对（grader 过），但 agent 没走完流程，
@@ -313,4 +319,5 @@ def run_one(
         )
     except Exception:  # noqa: BLE001 — 兜底恢复全局状态后重抛
         config.set_project_dir(original_project_dir)
+        config.LLM_MAX_RETRIES = original_max_retries
         raise

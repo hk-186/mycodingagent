@@ -186,6 +186,26 @@ def test_run_one_restores_project_dir_on_grader_error(tmp_path):
     assert config.PROJECT_DIR == original_dir
 
 
+def test_run_one_overrides_max_retries_and_restores(tmp_path):
+    """eval 期间 LLM_MAX_RETRIES 被临时覆盖为 EVAL_LLM_MAX_RETRIES，结束恢复。"""
+    task = _task(tmp_path, graders=[{"type": "file_exists", "path": "a.py"}])
+    task.fixture_dir.joinpath("a.py").write_text("x = 1\n", encoding="utf-8")
+    agent = FakeAgent([([{"n": {"messages": [_ai("done")]}}], ())])
+
+    seen = {}
+
+    def spy_build(*a, **kw):
+        seen["retries"] = config.LLM_MAX_RETRIES  # build_agent 时读取生效值
+        return agent
+
+    original = config.LLM_MAX_RETRIES
+    result = run_one(task, build_agent=spy_build)
+
+    assert seen["retries"] == config.EVAL_LLM_MAX_RETRIES
+    assert config.LLM_MAX_RETRIES == original  # 结束后恢复
+    assert result.passed
+
+
 def test_run_one_timeout_not_passed_even_if_graders_ok(tmp_path):
     """超时任务即使文件已改对（grader 全过）也不算 pass——流程没走完。
 
