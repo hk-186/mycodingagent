@@ -20,7 +20,7 @@ from langchain_openai import ChatOpenAI
 from deepagents import create_deep_agent
 
 from mycodingagent import config
-from mycodingagent.approvals import should_interrupt_command
+from mycodingagent.approvals import should_interrupt_command, should_interrupt_delete
 from mycodingagent.project_middleware import ProjectMemoryMiddleware
 from mycodingagent.prompt_runtime import RuntimePromptMiddleware
 from mycodingagent.tools.ask_user import ask_user
@@ -101,6 +101,8 @@ def _shell_environment_hint() -> str:
     if sys.platform == "win32":
         return (
             f"运行平台：Windows（{platform.release()}），execute 的命令由 cmd.exe 执行。\n"
+            "- cmd.exe 没有 rm；删除单个文件用 del 或 delete 工具，禁止套用 rm 语法。\n"
+            "- delete 工具与 del/erase 单文件删除会触发审批；del /s、rd/rmdir /s 等递归删除会被直接拦截。\n"
             "- 多条命令用 && 连接，禁止用分号 ;\n"
             "- 列目录用 dir（不是 ls），查看当前目录用 cd（不是 pwd）\n"
             "- 路径用反斜杠或加引号；环境变量写作 %VAR%（不是 $VAR）\n"
@@ -120,6 +122,12 @@ def _execute_description_factory(tool_call, state, runtime) -> str:  # noqa: ANN
     """execute 工具审批摘要：展示待执行的 shell 命令。"""
     command = (tool_call.get("args") or {}).get("command", "")
     return f"即将执行 shell 命令：\n  {command}"
+
+
+def _delete_description_factory(tool_call, state, runtime) -> str:  # noqa: ANN001
+    """delete 工具审批摘要：展示待删除的虚拟路径。"""
+    file_path = (tool_call.get("args") or {}).get("file_path", "(未知路径)")
+    return f"即将删除文件：\n  {file_path}"
 
 
 def _commit_description_factory(tool_call, state, runtime) -> str:  # noqa: ANN001
@@ -211,6 +219,7 @@ def build_deep_agent(checkpointer, store, backend=None):
 
     # 阶段 3：interrupt_on 配置——deepagents 原生 HITL 能力
     # - execute：危险/灰区命令（plan_mode=all 时所有写命令）触发审批
+    # - delete：deepagents 内置文件删除工具，永久删除文件，需用户审批
     # - git_commit：展示 status+diff 摘要后等审批
     # - ask_user：respond 决策让用户代答
     # - propose_plan：approve/reject 决策
@@ -219,6 +228,11 @@ def build_deep_agent(checkpointer, store, backend=None):
             when=should_interrupt_command,
             allowed_decisions=["approve", "reject"],
             description=_execute_description_factory,
+        ),
+        "delete": InterruptOnConfig(
+            when=should_interrupt_delete,
+            allowed_decisions=["approve", "reject"],
+            description=_delete_description_factory,
         ),
         "git_commit": InterruptOnConfig(
             allowed_decisions=["approve", "reject"],
@@ -232,15 +246,16 @@ def build_deep_agent(checkpointer, store, backend=None):
         ),
     }
 
-    # 阶段 5 子代理：code-reviewer（改动后审查）、test-writer（补测试）
+    # 阶段 5 子代理：code-reviewer（按需代码审查）、test-writer（补测试）
     # 两个子代理都只读（不给写工具），输出结构化意见由主 Agent 决定是否采纳；
     # 显式 interrupt_on={} 避免继承父级审批配置。
     code_reviewer_subagent = {
         "name": "code-reviewer",
         "description": (
-            "代码审查专家。主 Agent 完成代码改动并验证通过后，把本次改动的文件"
-            "或 git diff 交给它审查：正确性、边界情况、可维护性、潜在 bug 与"
-            "安全风险。输入应说明改了哪些文件、任务目标是什么。"
+            "代码审查专家。仅在用户明确要求审查或检查代码改动时使用，"
+            "把本次改动的文件或 git diff 交给它审查：正确性、边界情况、"
+            "可维护性、潜在 bug 与安全风险。输入应说明改了哪些文件、"
+            "任务目标是什么。"
         ),
         "model": llm,
         "system_prompt": (
@@ -290,7 +305,7 @@ def build_deep_agent(checkpointer, store, backend=None):
             "当前工作目标目录：__PROJECT_DIR__\n"
             "审批模式：__APPROVAL_MODE____PLAN_MODE_LABEL__\n"
             "\n## 文件路径约定（重要）\n"
-            "- ls / read_file / write_file / edit_file / glob / grep 一律使用"
+            "- ls / read_file / write_file / edit_file / delete / glob / grep 一律使用"
             "以 / 开头的虚拟路径，/ 就代表上面的项目目录本身：\n"
             "  / 映射到项目根目录；/src/app.py 映射到 项目目录/src/app.py。\n"
             "- 禁止给这些工具传 D:\\... 这类 Windows 绝对路径（会直接报错）。\n"
@@ -327,9 +342,9 @@ def build_deep_agent(checkpointer, store, backend=None):
             "全部完成后再汇报。\n"
             "- 完成后用中文简要汇报：改了哪些文件、如何验证、结果如何。\n"
             "\n## 人机协作（阶段 3）\n"
-            "- execute 的危险/灰区命令（rm、git reset、批量删除、卸载包等）会"
-            "被自动拦截等用户审批。被 reject 时表示用户拒绝该次操作，"
-            "不要换写法绕过，按拒绝理由调整方案即可。\n"
+            "- execute 的危险/灰区命令（rm/del、git reset、批量删除、卸载包等）与 "
+            "delete 删除文件会被自动拦截等用户审批。被 reject 时表示用户拒绝该次操作，"
+            "不要换写法绕过（例如被拒后改用 del/rm/Remove-Item 或 delete），按拒绝理由调整方案即可。\n"
             "- git_commit 会先展示 status+已暂存 diff 摘要给用户审批，"
             "approve 后才真正提交。提交前请确认变更已 git add 暂存。\n"
             "- 信息不足（如多个合理实现方案、缺关键参数）时调用 ask_user "
@@ -346,8 +361,8 @@ def build_deep_agent(checkpointer, store, backend=None):
             "save_project_fact 记下来，让后续会话能延续。\n"
             "- 项目根目录的 AGENTS.md 会自动加载（若存在）；把它视为项目规则"
             "参考，与用户明确指令冲突时以用户为准。\n"
-            "- 代码改动并验证通过后，必须用 task 工具委派 code-reviewer 审查"
-            "本次改动（说明任务目标与改动文件）；收到【必须修改】意见要处理后"
+            "- 用户要求审查代码时，必须用 task 工具委派 code-reviewer 审查"
+            "本次改动（说明任务目标与改动文件）；收到【必须修改】意见并处理后"
             "重新验证，【确认通过】后再向用户汇报。\n"
             "- 用户要求补测试，或改动缺少测试覆盖时，用 task 委派 test-writer "
             "获取测试方案，由你负责落地并跑通。\n"

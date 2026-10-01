@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """动态 prompt 占位符替换与 RuntimePromptMiddleware 测试。"""
 
+import sys
+
 import pytest
 
 from mycodingagent import config
@@ -60,6 +62,18 @@ def test_empty_text_passthrough():
 def test_text_without_placeholder_unchanged():
     text = "普通 prompt，没有占位符"
     assert render_runtime_fields(text) == text
+
+
+def test_windows_shell_hint_mentions_cmd_delete_and_no_rm(monkeypatch):
+    """Windows 提示必须明确 cmd.exe 无 rm，并给出 del/delete 审批预期。"""
+    monkeypatch.setattr(sys, "platform", "win32")
+    from mycodingagent.agent import _shell_environment_hint
+
+    hint = _shell_environment_hint()
+    assert "cmd.exe" in hint
+    assert "没有 rm" in hint
+    assert "del" in hint
+    assert "delete" in hint
 
 
 # ============================================================

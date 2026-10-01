@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """eval runner：自动 approve 循环与单任务沙箱流程（FakeAgent，不调真实 LLM）。"""
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +11,13 @@ from langgraph.types import Command
 
 from mycodingagent import config
 from mycodingagent.eval.loader import EvalTask
-from mycodingagent.eval.runner import STOP_TIMEOUT, auto_approve_loop, run_one
+from mycodingagent.eval.runner import (
+    STOP_TIMEOUT,
+    _configure_langsmith,
+    _restore_langsmith_env,
+    auto_approve_loop,
+    run_one,
+)
 
 
 # ============================================================
@@ -204,6 +211,31 @@ def test_run_one_overrides_max_retries_and_restores(tmp_path):
     assert seen["retries"] == config.EVAL_LLM_MAX_RETRIES
     assert config.LLM_MAX_RETRIES == original  # 结束后恢复
     assert result.passed
+
+
+def test_langsmith_disabled_leaves_env_untouched(tmp_path, monkeypatch):
+    """默认不开 LangSmith：不改 LANGCHAIN_* 环境变量。"""
+    monkeypatch.setattr(config, "EVAL_LANGSMITH", False)
+    monkeypatch.setenv("LANGCHAIN_TRACING_V2", "false")
+    assert _configure_langsmith(_task(tmp_path)) == {}
+    assert os.environ["LANGCHAIN_TRACING_V2"] == "false"
+
+
+def test_langsmith_enabled_sets_project_and_restores(tmp_path, monkeypatch):
+    """开启时强制 tracing=true 并设置 project；用后恢复原 env。"""
+    monkeypatch.setattr(config, "EVAL_LANGSMITH", True)
+    monkeypatch.setattr(config, "EVAL_LANGSMITH_PROJECT", "eval-proj")
+    monkeypatch.setenv("LANGCHAIN_TRACING_V2", "false")
+    monkeypatch.setenv("LANGCHAIN_PROJECT", "old-proj")
+
+    previous = _configure_langsmith(_task(tmp_path))
+    assert os.environ["LANGCHAIN_TRACING_V2"] == "true"
+    assert os.environ["LANGCHAIN_PROJECT"] == "eval-proj"
+    assert previous["__project__"] == "eval-proj"
+
+    _restore_langsmith_env(previous)
+    assert os.environ["LANGCHAIN_TRACING_V2"] == "false"
+    assert os.environ["LANGCHAIN_PROJECT"] == "old-proj"
 
 
 def test_run_one_timeout_not_passed_even_if_graders_ok(tmp_path):

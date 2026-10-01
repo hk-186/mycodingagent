@@ -9,7 +9,11 @@
 import pytest
 
 from mycodingagent import config
-from mycodingagent.approvals import _is_write_shell_command, should_interrupt_command
+from mycodingagent.approvals import (
+    _is_write_shell_command,
+    should_interrupt_command,
+    should_interrupt_delete,
+)
 from mycodingagent.permissions import classify_command
 
 
@@ -23,6 +27,18 @@ def _req(command: str) -> dict:
             "name": "execute",
             "args": {"command": command},
             "id": "c1",
+            "type": "tool_call",
+        }
+    }
+
+
+def _delete_req(file_path: str = "/old.py") -> dict:
+    """构造一个 delete 工具的 ToolCallRequest。"""
+    return {
+        "tool_call": {
+            "name": "delete",
+            "args": {"file_path": file_path},
+            "id": "d1",
             "type": "tool_call",
         }
     }
@@ -176,6 +192,45 @@ class TestShouldInterruptCommand:
         monkeypatch.setattr(config, "APPROVAL_MODE", "disabled")
         monkeypatch.setattr(config, "PLAN_MODE", True)
         assert should_interrupt_command(_req("git commit -m 'fix'")) is True
+
+
+# ============================================================
+# should_interrupt_delete：delete 工具单独审批（不走 shell 分类）
+# ============================================================
+class TestShouldInterruptDelete:
+    """delete 是内置文件工具，永久删除文件，minimal/all/Plan 都要审批。"""
+
+    def test_minimal_interrupts_delete(self, monkeypatch):
+        monkeypatch.setattr(config, "APPROVAL_MODE", "minimal")
+        monkeypatch.setattr(config, "PLAN_MODE", False)
+        assert should_interrupt_delete(_delete_req("/utils.py")) is True
+
+    def test_all_interrupts_delete(self, monkeypatch):
+        monkeypatch.setattr(config, "APPROVAL_MODE", "all")
+        monkeypatch.setattr(config, "PLAN_MODE", False)
+        assert should_interrupt_delete(_delete_req("/utils.py")) is True
+
+    def test_disabled_allows_delete(self, monkeypatch):
+        monkeypatch.setattr(config, "APPROVAL_MODE", "disabled")
+        monkeypatch.setattr(config, "PLAN_MODE", False)
+        assert should_interrupt_delete(_delete_req("/utils.py")) is False
+
+    def test_plan_mode_overrides_disabled(self, monkeypatch):
+        monkeypatch.setattr(config, "APPROVAL_MODE", "disabled")
+        monkeypatch.setattr(config, "PLAN_MODE", True)
+        assert should_interrupt_delete(_delete_req("/utils.py")) is True
+
+    def test_non_delete_tool_returns_false(self, monkeypatch):
+        monkeypatch.setattr(config, "APPROVAL_MODE", "minimal")
+        monkeypatch.setattr(config, "PLAN_MODE", False)
+        req = {"tool_call": {"name": "read_file", "args": {"file_path": "/x.py"}, "id": "x", "type": "tool_call"}}
+        assert should_interrupt_delete(req) is False
+
+    def test_missing_file_path_returns_false(self, monkeypatch):
+        monkeypatch.setattr(config, "APPROVAL_MODE", "minimal")
+        monkeypatch.setattr(config, "PLAN_MODE", False)
+        req = {"tool_call": {"name": "delete", "args": {}, "id": "x", "type": "tool_call"}}
+        assert should_interrupt_delete(req) is False
 
 
 # ============================================================

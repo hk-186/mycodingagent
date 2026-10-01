@@ -75,6 +75,26 @@ def _is_write_shell_command(command: str) -> bool:
     return False
 
 
+def should_interrupt_delete(tool_call_request: Any) -> bool:
+    """`InterruptOnConfig.when` 谓词：delete 工具删除文件前触发审批。
+
+    delete 是 deepagents 内置文件工具，不走 execute/shell 分类；它同样会
+    永久删除文件，默认（minimal/all）与 Plan 模式都需要用户审批。仅在
+    APPROVAL_MODE=disabled 且非 Plan 模式时放行。
+    """
+    tool_call = getattr(tool_call_request, "tool_call", None)
+    if tool_call is None and isinstance(tool_call_request, dict):
+        tool_call = tool_call_request.get("tool_call")
+    if not tool_call or tool_call.get("name") != "delete":
+        return False
+    file_path = (tool_call.get("args") or {}).get("file_path")
+    if not isinstance(file_path, str) or not file_path:
+        return False
+    if config.PLAN_MODE:
+        return True
+    return config.APPROVAL_MODE != "disabled"
+
+
 def should_interrupt_command(tool_call_request: Any) -> bool:
     """`InterruptOnConfig.when` 谓词：是否对这次 execute 工具调用触发审批。
 

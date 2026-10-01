@@ -20,6 +20,7 @@ eval 单任务运行器
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import shutil
 import subprocess
@@ -77,6 +78,120 @@ class TaskResult:
     error: str = ""
     final_report: str = ""
     diff: str = ""
+
+
+# ============================================================
+# 可选 LangSmith 观测层（默认关；只增强追踪/反馈，不参与判定）
+# ============================================================
+_LANGSMITH_ENV_KEYS = (
+    "LANGSMITH_TRACING",
+    "LANGSMITH_PROJECT",
+    "LANGCHAIN_TRACING_V2",
+    "LANGCHAIN_PROJECT",
+)
+
+
+def _configure_langsmith(task: EvalTask) -> dict[str, str | None]:
+    """EVAL_LANGSMITH=1 时开启 LangSmith tracing；返回需恢复的 env 快照。"""
+    if not config.EVAL_LANGSMITH:
+        return {}
+    previous = {key: os.environ.get(key) for key in _LANGSMITH_ENV_KEYS}
+    project = (
+        config.EVAL_LANGSMITH_PROJECT
+        or os.environ.get("LANGCHAIN_PROJECT")
+        or "mycodingagent-eval"
+    )
+    # 新版 SDK 读 LANGSMITH_*；LangChain 旧集成读 LANGCHAIN_*。两套都写，
+    # 保证 langsmith 0.13+ 与旧版 langchain-core 都能触发详细 trace。
+    os.environ["LANGSMITH_TRACING"] = "true"
+    os.environ["LANGSMITH_PROJECT"] = project
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    os.environ["LANGCHAIN_PROJECT"] = project
+    previous["__project__"] = project
+    return previous
+
+
+def _restore_langsmith_env(previous: dict[str, str | None]) -> None:
+    for key in _LANGSMITH_ENV_KEYS:
+        if key not in previous:
+            continue
+        value = previous[key]
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def _emit_langsmith_feedback(
+    task: EvalTask, result: TaskResult, project: str | None
+) -> None:
+    """把 eval 汇总写成一条 LangSmith run + feedback；失败只告警，不改判定。"""
+    if not config.EVAL_LANGSMITH or not project:
+        return
+    try:
+        from langsmith import Client, RunTree
+    except Exception as e:  # noqa: BLE001 — LangSmith 是可选依赖
+        logger.warning("EVAL_LANGSMITH 已开启但 langsmith 不可用：%s", e)
+        return
+
+    try:
+        client = Client()
+        # 新版 feedback API 要求 session_id（= project/session ID）；
+        # RunTree.post 不会回填该字段，显式查一次 project。
+        session_id = client.read_project(project_name=project).id
+        run = RunTree(
+            name=f"eval:{task.name}",
+            run_type="chain",
+            inputs={"prompt": task.prompt, "task_type": task.type},
+            project_name=project,
+            tags=["eval", task.name, task.type],
+            metadata={
+                "timeout_seconds": task.timeout_seconds,
+                "stopped_reason": result.stopped_reason,
+            },
+        )
+        run.post()
+        run.end(
+            outputs={
+                "passed": result.passed,
+                "stopped_reason": result.stopped_reason,
+                "error": result.error,
+                "steps": result.steps,
+                "tokens": result.tokens,
+                "elapsed_seconds": result.elapsed_seconds,
+                "final_report": result.final_report,
+                "diff": result.diff,
+                "grader_results": [
+                    {
+                        "type": r.type,
+                        "passed": r.passed,
+                        "detail": r.detail,
+                        "score": r.score,
+                    }
+                    for r in result.grader_results
+                ],
+            },
+            error=result.error or None,
+        )
+        run.patch()
+        client.create_feedback(
+            run_id=run.id,
+            key="eval_pass",
+            score=1.0 if result.passed else 0.0,
+            comment=result.error or result.stopped_reason,
+            session_id=session_id,
+        )
+        for r in result.grader_results:
+            if r.type == "llm_review":
+                client.create_feedback(
+                    run_id=run.id,
+                    key="llm_review",
+                    score=float(r.score),
+                    comment=r.detail,
+                    session_id=session_id,
+                )
+    except Exception as e:  # noqa: BLE001 — 观测层故障不拖垮 eval
+        logger.warning("LangSmith 写入失败（不影响 eval 判定）：%s", e)
 
 
 # ============================================================
@@ -264,6 +379,7 @@ def run_one(
     # 临时覆盖 LLM_MAX_RETRIES（agent/llm_review 构建时读取），结束恢复。
     original_max_retries = config.LLM_MAX_RETRIES
     config.LLM_MAX_RETRIES = config.EVAL_LLM_MAX_RETRIES
+    langsmith_env = _configure_langsmith(task)
     try:
         with tempfile.TemporaryDirectory(prefix="mca-eval-") as sandbox_str:
             sandbox = Path(sandbox_str)
@@ -295,6 +411,7 @@ def run_one(
             finally:
                 config.set_project_dir(original_project_dir)
                 config.LLM_MAX_RETRIES = original_max_retries
+                _restore_langsmith_env(langsmith_env)
 
         # 判定语义：grader 全过且 agent 正常收尾（completed）才算 pass。
         # 超时/超限场景下文件可能已改对（grader 过），但 agent 没走完流程，
@@ -304,7 +421,7 @@ def run_one(
             and all(r.passed for r in grader_results)
             and outcome.stopped_reason == "completed"
         )
-        return TaskResult(
+        result = TaskResult(
             name=task.name,
             type=task.type,
             passed=passed,
@@ -317,7 +434,10 @@ def run_one(
             final_report=outcome.final_report,
             diff=diff,
         )
+        _emit_langsmith_feedback(task, result, langsmith_env.get("__project__"))
+        return result
     except Exception:  # noqa: BLE001 — 兜底恢复全局状态后重抛
         config.set_project_dir(original_project_dir)
         config.LLM_MAX_RETRIES = original_max_retries
+        _restore_langsmith_env(langsmith_env)
         raise

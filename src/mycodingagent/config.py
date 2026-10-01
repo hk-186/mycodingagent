@@ -142,11 +142,20 @@ def project_namespace() -> tuple[str, ...]:
 # EVAL_REVIEW_MODEL：llm_review 评审模型；留空则复用 MODEL_NAME。
 # EVAL_REVIEW_PASS_SCORE：llm_review 及格线（1-5 分制）。
 # EVAL_LLM_MAX_RETRIES：eval 运行期间临时覆盖 LLM_MAX_RETRIES（默认 1）。
-# 端点抖动时重试会把单次逻辑调用放大到 LLM_TIMEOUT×(1+重试)，子代理多轮
-# 循环累积轻松超过单任务时限；eval 求快速失败，交互场景仍用全局配置。
+#   端点抖动时重试会把单次逻辑调用放大到 LLM_TIMEOUT×(1+重试)，子代理多轮
+#   循环累积轻松超过单任务时限；eval 求快速失败，交互场景仍用全局配置。
+# EVAL_LANGSMITH：=1 时把 eval 运行 trace 到 LangSmith（需 LANGCHAIN_API_KEY）。
+# EVAL_LANGSMITH_PROJECT：LangSmith project 名；留空默认 mycodingagent-eval。
 # ------------------------------------------------------------
 EVAL_TASK_TIMEOUT = int(os.getenv("EVAL_TASK_TIMEOUT", "600"))
 EVAL_COMMAND_TIMEOUT = int(os.getenv("EVAL_COMMAND_TIMEOUT", "120"))
 EVAL_REVIEW_MODEL = os.getenv("EVAL_REVIEW_MODEL", "")
 EVAL_REVIEW_PASS_SCORE = int(os.getenv("EVAL_REVIEW_PASS_SCORE", "3"))
 EVAL_LLM_MAX_RETRIES = int(os.getenv("EVAL_LLM_MAX_RETRIES", "1"))
+EVAL_LANGSMITH = os.getenv("EVAL_LANGSMITH", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+EVAL_LANGSMITH_PROJECT = os.getenv("EVAL_LANGSMITH_PROJECT", "")
