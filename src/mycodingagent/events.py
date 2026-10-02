@@ -247,18 +247,29 @@ def iter_task_events(
                     if isinstance(msg, AIMessage):
                         steps += 1
                         tokens += _usage_total_tokens(msg)
+                        # 思考过程（DeepSeek reasoning_content）优先展示
+                        reasoning = (
+                            (msg.additional_kwargs or {}).get("reasoning_content")
+                            or ""
+                        ).strip()
+                        if reasoning:
+                            yield AgentEvent(
+                                type=ASSISTANT_MESSAGE,
+                                name="reasoning",
+                                text=reasoning,
+                            )
+                        # 先输出正文（思考过程），再报工具调用——
+                        # 带 tool_calls 的消息正文是模型调用工具前的推理，
+                        # 展示出来便于观察决策过程
+                        text = _message_text(msg.content).strip()
+                        if text:
+                            yield AgentEvent(type=ASSISTANT_MESSAGE, text=text)
                         for tc in msg.tool_calls or []:
                             yield AgentEvent(
                                 type=TOOL_START,
                                 name=str(tc.get("name", "")),
                                 args_preview=_truncate(str(tc.get("args", "")), 120),
                             )
-                        # 与旧版 CLI 行为一致：带工具调用的消息只报工具调用，
-                        # 最终回答（无 tool_calls 的 AI 消息）才输出正文
-                        if not msg.tool_calls:
-                            text = _message_text(msg.content).strip()
-                            if text:
-                                yield AgentEvent(type=ASSISTANT_MESSAGE, text=text)
                         pending_work = pending_work or bool(msg.tool_calls)
                     elif isinstance(msg, ToolMessage):
                         yield AgentEvent(
@@ -338,7 +349,8 @@ def render_event(ev: AgentEvent) -> str:
         tag = "工具失败" if ev.is_error else "工具结果"
         return f"  [{tag}] {ev.name}: {ev.text}"
     if ev.type == ASSISTANT_MESSAGE:
-        return f"助手> {ev.text}"
+        prefix = "思考> " if ev.name == "reasoning" else "助手> "
+        return f"{prefix}{ev.text}"
     if ev.type == ERROR:
         return f"[!] {ev.text}"
     if ev.type == INTERRUPT:

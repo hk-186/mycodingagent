@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 def get_llm() -> ChatOpenAI:
     """构建 LLM 客户端：temperature / timeout / 重试次数走集中配置（修复计划 E7）。"""
-    return ChatOpenAI(
+    return ReasoningChatOpenAI(
         model=config.MODEL_NAME,
         api_key=config.API_KEY,
         base_url=config.BASE_URL,
@@ -54,6 +54,33 @@ def get_llm() -> ChatOpenAI:
         timeout=config.LLM_TIMEOUT,
         max_retries=config.LLM_MAX_RETRIES,
     )
+
+
+class ReasoningChatOpenAI(ChatOpenAI):
+    """补回 DeepSeek 等端点返回的 reasoning_content。
+
+    langchain-openai 1.6 的 _convert_dict_to_message 不解析该字段，
+    导致推理过程被静默丢弃。这里在 _create_chat_result 后把它
+    塞回 AIMessage.additional_kwargs["reasoning_content"]，
+    供事件层展示思考过程。上游没有该字段时行为与父类完全一致。
+    """
+
+    def _create_chat_result(self, response, generation_info=None):
+        result = super()._create_chat_result(response, generation_info)
+        try:
+            response_dict = (
+                response
+                if isinstance(response, dict)
+                else response.model_dump(warnings=False)
+            )
+            choices = response_dict.get("choices") or []
+            for gen, choice in zip(result.generations, choices):
+                rc = ((choice or {}).get("message") or {}).get("reasoning_content")
+                if rc:
+                    gen.message.additional_kwargs["reasoning_content"] = rc
+        except Exception:  # noqa: BLE001 - 解析失败不影响主流程
+            logger.debug("补回 reasoning_content 失败", exc_info=True)
+        return result
 
 
 # ============================================================

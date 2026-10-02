@@ -58,7 +58,7 @@ def tools_update(*messages):
     return {"tools": {"messages": list(messages)}}
 
 
-def ai(content="", tool_calls=None, total_tokens=None):
+def ai(content="", tool_calls=None, total_tokens=None, reasoning=None):
     kwargs = {}
     if total_tokens is not None:
         kwargs["usage_metadata"] = {
@@ -66,6 +66,8 @@ def ai(content="", tool_calls=None, total_tokens=None):
             "output_tokens": 1,
             "total_tokens": total_tokens,
         }
+    if reasoning:
+        kwargs["additional_kwargs"] = {"reasoning_content": reasoning}
     return AIMessage(content=content, tool_calls=tool_calls or [], **kwargs)
 
 
@@ -146,13 +148,74 @@ def test_non_dict_and_none_updates_skipped():
     assert [e.type for e in events] == [ASSISTANT_MESSAGE, SUMMARY]
 
 
-def test_message_without_tool_calls_but_text_only_reports_text():
-    """带工具调用时只报 tool_start，不重复输出正文（与旧 CLI 行为一致）。"""
+def test_message_with_tool_calls_shows_reasoning():
+    """带 tool_calls 的 AI 消息正文（思考过程）也要输出，再跟工具调用事件。"""
     msg = ai(content="我先看看文件", tool_calls=[tool_call(name="ls", id="c1")])
     agent = FakeAgent([model_update(msg)])
     events = collect(agent, user_input="x")
-    assert [e.type for e in events] == [TOOL_START, SUMMARY]
-    assert events[0].name == "ls"
+    assert [e.type for e in events] == [ASSISTANT_MESSAGE, TOOL_START, SUMMARY]
+    assert events[0].text == "我先看看文件"
+    assert events[1].name == "ls"
+
+
+def test_reasoning_content_emitted_before_text():
+    """reasoning_content 作为"思考>"事件输出，位于正文之前。"""
+    msg = ai(
+        content="答案是 2",
+        reasoning="用户问 1+1，直接算就行",
+    )
+    agent = FakeAgent([model_update(msg)])
+    events = collect(agent, user_input="x")
+    types = [e.type for e in events]
+    assert types == [ASSISTANT_MESSAGE, ASSISTANT_MESSAGE, SUMMARY]
+    assert events[0].name == "reasoning"
+    assert events[0].text == "用户问 1+1，直接算就行"
+    assert render_event(events[0]).startswith("思考> ")
+    assert events[1].name == ""
+    assert render_event(events[1]).startswith("助手> ")
+
+
+# ============================================================
+# ReasoningChatOpenAI：补回 DeepSeek 的 reasoning_content
+# ============================================================
+class TestReasoningChatOpenAI:
+    def _make_response(self, reasoning_content=None):
+        message = {"role": "assistant", "content": "2"}
+        if reasoning_content is not None:
+            message["reasoning_content"] = reasoning_content
+        return {
+            "id": "chatcmpl-x",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "deepseek-flash",
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    def _llm(self):
+        from mycodingagent.agent import ReasoningChatOpenAI
+
+        return ReasoningChatOpenAI(
+            model="deepseek-flash", api_key="sk-test", base_url="http://x"
+        )
+
+    def test_reasoning_content_restored(self):
+        result = self._llm()._create_chat_result(
+            self._make_response("先想一下再回答")
+        )
+        msg = result.generations[0].message
+        assert msg.additional_kwargs["reasoning_content"] == "先想一下再回答"
+        assert msg.content == "2"
+
+    def test_no_reasoning_field_unchanged(self):
+        result = self._llm()._create_chat_result(self._make_response())
+        msg = result.generations[0].message
+        assert "reasoning_content" not in msg.additional_kwargs
+        assert msg.content == "2"
 
 
 # ============================================================

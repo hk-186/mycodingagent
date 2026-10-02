@@ -256,6 +256,7 @@ def chat(agent, store, checkpointer, backend) -> None:
                 print("  /sessions             列出所有历史会话")
                 print("  /switch <id|序号>     切换到指定会话")
                 print("  /new [名字]           开启新会话（旧会话历史保留在磁盘）")
+                print("  /delete <id|序号>     删除指定会话的历史记录（当前会话除外）")
                 print("  /resume               从断点继续当前会话中断的任务")
                 print("  /memory               查看长期记忆中保存的用户信息")
                 print("  /history              查看当前会话的消息统计")
@@ -296,6 +297,25 @@ def chat(agent, store, checkpointer, backend) -> None:
                     n = len(state.values.get("messages", [])) if state.values else 0
                     status = "中断" if state.next else "等待输入"
                     print(f"[已切换到会话: {thread_id}]  ({n} 条消息, {status})")
+            elif cmd == "/delete":
+                from mycodingagent.sessions import (
+                    delete_session,
+                    list_sessions,
+                    resolve_switch_arg,
+                )
+                if not arg.strip():
+                    print("[用法：/delete <id|序号>，先 /sessions 查看列表]")
+                    continue
+                sessions = list_sessions(checkpointer.conn, get_state)
+                tid = resolve_switch_arg(arg, sessions)
+                if tid is None:
+                    print(f"[找不到会话: {arg}，输入 /sessions 查看可用会话]")
+                elif tid == thread_id:
+                    print("[不能删除当前会话，请先 /new 或 /switch 切换到其他会话]")
+                elif delete_session(checkpointer.conn, tid):
+                    print(f"[已删除会话: {tid}]")
+                else:
+                    print(f"[会话无历史记录或已删除: {tid}]")
             elif cmd == "/memory":
                 items = store.search(("users",))
                 if not items:
@@ -350,6 +370,11 @@ def main() -> None:
         default=None,
         help="工作目标项目目录（默认 workspace/，或环境变量 AGENT_PROJECT_DIR）",
     )
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="使用 Textual 终端图形界面（默认普通 CLI）",
+    )
     args = parser.parse_args()
     if args.project:
         try:
@@ -394,7 +419,14 @@ def main() -> None:
             root_dir=str(config.PROJECT_DIR), inherit_env=True
         )
         agent = build_deep_agent(checkpointer, store, backend=backend)
-        chat(agent, store, checkpointer, backend)
+        if args.tui:
+            from mycodingagent.tui.app import AgentApp
+
+            AgentApp(
+                agent, backend, store=store, checkpointer=checkpointer
+            ).run()
+        else:
+            chat(agent, store, checkpointer, backend)
 
     print("再见！对话历史、长期记忆和文件都已保存，下次启动依然有效。")
 

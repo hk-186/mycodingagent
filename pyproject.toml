@@ -16,6 +16,7 @@ dependencies = [
     "langchain-tavily>=0.2",
     "python-dotenv>=1.0",
     "sqlite-vec>=0.1",
+    "textual>=0.86",
 ]
 
 [project.optional-dependencies]

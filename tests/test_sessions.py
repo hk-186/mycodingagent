@@ -14,6 +14,7 @@ import pytest
 
 from mycodingagent.sessions import (
     SessionInfo,
+    delete_session,
     format_sessions,
     list_sessions,
     resolve_switch_arg,
@@ -281,3 +282,55 @@ class TestListSessions:
         )
         sessions = list_sessions(conn, lambda tid: state)
         assert sessions[0].step == 0
+
+
+# ============================================================
+# delete_session：同时清理 checkpoints 和 writes 两张表
+# ============================================================
+class TestDeleteSession:
+    @pytest.fixture
+    def conn(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE checkpoints (thread_id TEXT, checkpoint_id TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE writes (thread_id TEXT, task_id TEXT)"
+        )
+        for tid in ("main", "sess-b"):
+            conn.execute(
+                "INSERT INTO checkpoints VALUES (?, ?)", (tid, f"ckpt-{tid}")
+            )
+            conn.execute(
+                "INSERT INTO writes VALUES (?, ?)", (tid, f"task-{tid}")
+            )
+        conn.commit()
+        return conn
+
+    def test_delete_existing(self, conn):
+        assert delete_session(conn, "sess-b") is True
+        remaining = {
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT thread_id FROM checkpoints"
+            ).fetchall()
+        }
+        remaining_writes = {
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT thread_id FROM writes"
+            ).fetchall()
+        }
+        assert remaining == {"main"}
+        assert remaining_writes == {"main"}
+
+    def test_delete_nonexistent(self, conn):
+        assert delete_session(conn, "ghost") is False
+        # 其他会话不受影响
+        remaining = {
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT thread_id FROM checkpoints"
+            ).fetchall()
+        }
+        assert remaining == {"main", "sess-b"}

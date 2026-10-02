@@ -2,10 +2,11 @@
 """
 会话管理
 ========
-列出历史会话、解析 /switch 参数。
+列出历史会话、解析 /switch 参数、删除会话。
 thread_id 列表通过直接查 SqliteSaver 的 checkpoints 表获得
 （LangGraph 没有提供"列出所有 thread_id"的公开 API）。
 会话状态通过 agent.get_state() 拿 StateSnapshot 判断。
+删除会话需同时清理 checkpoints 和 writes 两张表。
 """
 
 import sqlite3
@@ -155,3 +156,20 @@ def resolve_switch_arg(arg: str, sessions: list[SessionInfo]) -> str | None:
         return matches[0]
 
     return None
+
+
+# ============================================================
+# 删除会话
+# ============================================================
+def delete_session(conn: sqlite3.Connection, thread_id: str) -> bool:
+    """删除指定会话的全部 checkpoint 记录（checkpoints + writes 两张表）。
+
+    Returns:
+        是否删到了记录（thread_id 不存在时为 False）。
+    """
+    cur = conn.cursor()
+    cur.execute("DELETE FROM writes WHERE thread_id = ?", (thread_id,))
+    cur.execute("DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,))
+    deleted = cur.rowcount > 0
+    conn.commit()
+    return deleted
