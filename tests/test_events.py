@@ -14,6 +14,7 @@ from mycodingagent.events import (
     ASSISTANT_MESSAGE,
     ERROR,
     STOP_COMPLETED,
+    STOP_ERROR,
     STOP_INTERRUPTED,
     STOP_RECURSION_LIMIT,
     STOP_STEP_LIMIT,
@@ -300,6 +301,59 @@ def test_keyboard_interrupt_becomes_error_event():
     events = collect(agent, user_input="x")
     assert events[-1].stopped_reason == STOP_INTERRUPTED
     assert any("/resume" in e.text for e in events if e.type == ERROR)
+
+
+# ============================================================
+# LLM API 错误翻译
+# ============================================================
+class FakeAPIError(Exception):
+    """模拟 openai SDK 错误对象：带 status_code 属性。"""
+
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def test_friendly_llm_error_translations():
+    from mycodingagent.events import _friendly_llm_error
+
+    # DeepSeek 把业务错误包在 HTTP 500 里：按 message 匹配
+    assert "余额不足" in _friendly_llm_error(
+        FakeAPIError("Error code: 500 - {'message': 'Insufficient Balance'}", 500)
+    )
+    assert "API Key" in _friendly_llm_error(FakeAPIError("invalid api key", 401))
+    assert "403" in _friendly_llm_error(FakeAPIError("permission denied", 403))
+    assert "MODEL_NAME" in _friendly_llm_error(FakeAPIError("model not found", 404))
+    assert "限流" in _friendly_llm_error(FakeAPIError("rate limit exceeded", 429))
+    assert "超时" in _friendly_llm_error(FakeAPIError("request timed out"))
+    assert "连接" in _friendly_llm_error(FakeAPIError("Connection error."))
+    # 未识别错误返回 None，走原有格式
+    assert _friendly_llm_error(FakeAPIError("weird unknown failure")) is None
+
+
+def test_llm_error_translated_in_event_stream():
+    """已识别的 API 错误在事件流里变成友好提示，不再暴露原始异常文本。"""
+    agent = FakeAgent(
+        [],
+        error=FakeAPIError(
+            "Error code: 500 - {'error': {'message': 'Insufficient Balance'}}", 500
+        ),
+    )
+    events = collect(agent, user_input="x")
+    errors = [e for e in events if e.type == ERROR]
+    assert len(errors) == 1
+    assert "余额不足" in errors[0].text
+    assert "/resume" in errors[0].text
+    assert events[-1].stopped_reason == STOP_ERROR
+
+
+def test_unknown_error_keeps_original_format():
+    agent = FakeAgent([], error=RuntimeError("boom"))
+    events = collect(agent, user_input="x")
+    errors = [e for e in events if e.type == ERROR]
+    assert len(errors) == 1
+    assert "RuntimeError" in errors[0].text
+    assert "boom" in errors[0].text
 
 
 # ============================================================

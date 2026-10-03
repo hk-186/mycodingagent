@@ -113,6 +113,35 @@ def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+def _friendly_llm_error(e: BaseException) -> str | None:
+    """识别常见 LLM API 错误并翻译成用户可操作的提示；无法识别返回 None。
+
+    openai SDK 的错误对象带 status_code；DeepSeek 等服务商还会把业务错误
+    （如余额不足）包在 HTTP 500 里，所以先按 message 内容匹配再按状态码。
+    """
+    status = getattr(e, "status_code", None)
+    text = str(e)
+    lower = text.lower()
+    if "insufficient balance" in lower:
+        return (
+            "模型服务提示账户余额不足。请前往服务商平台充值后，"
+            "输入 /resume 从断点继续。"
+        )
+    if status == 401 or "invalid api key" in lower or "incorrect api key" in lower:
+        return "API Key 无效或未生效（401）。请检查 .env 中的 API_KEY 配置。"
+    if status == 403:
+        return "服务拒绝访问（403）：当前 Key 可能未开通该模型或存在区域限制。"
+    if status == 404 or "model_not_found" in lower:
+        return "模型或端点不存在（404）。请检查 .env 中的 MODEL_NAME 与 BASE_URL。"
+    if status == 429 or "rate limit" in lower:
+        return "触发限流（429）。稍等片刻后输入 /resume 从断点继续。"
+    if "timed out" in lower or "timeout" in lower:
+        return "模型请求超时：服务响应过慢或网络不稳，稍后输入 /resume 重试。"
+    if "connection error" in lower or "getaddrinfo failed" in lower or "failed to establish" in lower:
+        return "无法连接模型服务。请检查网络与 .env 中的 BASE_URL 配置。"
+    return None
+
+
 # ============================================================
 # 阶段 3：HITL interrupt 检测
 # ============================================================
@@ -302,12 +331,19 @@ def iter_task_events(
                 )
                 break
     except Exception as e:  # noqa: BLE001 — 未知异常转成 error 事件而非让 CLI 崩溃
-        logger.exception("任务执行异常")
         stopped_reason = STOP_ERROR
-        yield AgentEvent(
-            type=ERROR,
-            text=f"任务执行异常（{type(e).__name__}）：{e}",
-        )
+        friendly = _friendly_llm_error(e)
+        if friendly is not None:
+            # 已识别的 API 错误：屏上给可操作提示，日志留一行原始错误，
+            # 避免整页 traceback 刷屏
+            logger.warning("已识别的 LLM API 错误：%s", e)
+            yield AgentEvent(type=ERROR, text=friendly)
+        else:
+            logger.exception("任务执行异常")
+            yield AgentEvent(
+                type=ERROR,
+                text=f"任务执行异常（{type(e).__name__}）：{e}",
+            )
     finally:
         close = getattr(stream, "close", None)
         if callable(close):
